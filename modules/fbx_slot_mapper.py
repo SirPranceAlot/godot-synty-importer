@@ -96,58 +96,150 @@ def resolve_slot_material(
     default_atlas_mat: str
 ) -> str:
     slot_lower = slot_name.lower()
-    fname_lower = fbx_file_name.lower()
+    fname_lower = fbx_file_name.lower().replace(".fbx", "")
 
-    if "glass" in slot_lower:
-        for k, v in available_materials.items():
-            if "glass" in k:
-                return v
+    # 1. Target Holograms
+    if "target_hologram" in fname_lower or "holotarget" in slot_lower or ("target" in slot_lower and "holo" in fname_lower):
+        for k in ["hologram_targets_01", "hologram_targets", "hologram_01"]:
+            if k in available_materials:
+                return available_materials[k]
 
-    if "holo" in slot_lower or "target" in slot_lower:
-        for k, v in available_materials.items():
-            if "holo" in k:
-                return v
+    # 2. Hologram Signs
+    if "holo_sign" in fname_lower or "holosign" in slot_lower:
+        for k in ["hologram_signs_01", "hologram_signs", "hologram_01"]:
+            if k in available_materials:
+                return available_materials[k]
 
-    if "posters" in slot_lower:
-        for k, v in available_materials.items():
-            if "poster" in k:
-                return v
-    if "signs" in slot_lower:
-        for k, v in available_materials.items():
-            if "sign" in k:
-                return v
-    if "trash" in slot_lower:
-        for k, v in available_materials.items():
-            if "trash" in k:
-                return v
+    # 3. Hologram Posters & Text
+    if "holo_poster" in fname_lower:
+        for k in ["hologram_posters_01_a", "hologram_posters_01_b", "hologram_01"]:
+            if k in available_materials:
+                return available_materials[k]
+    if "holo_text" in fname_lower:
+        for k in ["hologram_text_01", "hologram_01"]:
+            if k in available_materials:
+                return available_materials[k]
 
-    if "road" in slot_lower or "tyre" in slot_lower:
-        for k, v in available_materials.items():
-            if "road" in k:
-                return v
-    if "water" in slot_lower:
-        for k, v in available_materials.items():
-            if "water" in k:
-                return v
-    if "rock" in slot_lower or "mountain" in slot_lower:
-        for k, v in available_materials.items():
-            if "rock" in k or "mountain" in k:
-                return v
+    # 4. Hologram Trees & Cherry Trees
+    if "hologram_tree" in fname_lower or "hologram_cherry_tree" in fname_lower:
+        for k in ["hologram_01", "hologram_basic_01_a"]:
+            if k in available_materials:
+                return available_materials[k]
 
-    if "sm_bld_block_" in fname_lower:
-        for k, v in available_materials.items():
-            if "parallax_full_01" in k or "parallax" in k:
-                return v
+    # 5. Hologram Stands & Tables
+    if ("hologram_stand" in fname_lower or "hologram_table" in fname_lower or "holo_planter" in fname_lower) and ("holo" in slot_lower or "screen" in slot_lower):
+        for k in ["hologram_01", "hologram_basic_01_a"]:
+            if k in available_materials:
+                return available_materials[k]
 
-    if "wall" in slot_lower or "a_wall" in slot_lower:
+    # 6. Generic Holograms
+    if "holo" in slot_lower or "hologram" in slot_lower:
+        for k in ["hologram_01", "hologram_basic_01_a"]:
+            if k in available_materials:
+                return available_materials[k]
+
+    # 7. Posters
+    if "poster" in fname_lower or "poster" in slot_lower or "papers" in slot_lower:
+        for k in ["posters_01", "poster_01", "papers_01"]:
+            if k in available_materials:
+                return available_materials[k]
+
+    # 8. Billboards
+    if "damaged_sign" in fname_lower or "billboard_damaged" in fname_lower:
+        for k in ["billboard_01_damaged", "billboard_02_damaged", "billboard_01_a"]:
+            if k in available_materials:
+                return available_materials[k]
+    if "billboard_sign_small" in fname_lower or "billboard_backing_small" in fname_lower:
+        for k in ["billboard_03", "billboard_01_a"]:
+            if k in available_materials:
+                return available_materials[k]
+    if "billboard" in fname_lower or "billboard" in slot_lower:
+        for k in ["billboard_01_a", "billboard_02_a", "billboard_03"]:
+            if k in available_materials:
+                return available_materials[k]
+
+    # 9. Signs & Neon
+    if "neonsign" in fname_lower or "sign" in fname_lower or "sign" in slot_lower:
+        for k in ["signs_01", "billboard_03", "billboard_01_a"]:
+            if k in available_materials:
+                return available_materials[k]
+
+    # 10. Glass & Windows
+    if "glass" in slot_lower or "glass" in fname_lower:
+        for k in ["glass_01_a", "glass_transparent_01", "glass_01", "glass"]:
+            if k in available_materials:
+                return available_materials[k]
+
+    # 11. Trash & Junk
+    if "trash" in slot_lower or "trash" in fname_lower:
+        for k in ["trash_01", "junk_01"]:
+            if k in available_materials:
+                return available_materials[k]
+    if "junk_large" in fname_lower:
+        for k in ["junk_large_01", "junk_01"]:
+            if k in available_materials:
+                return available_materials[k]
+    if "junk" in fname_lower:
+        for k in ["junk_01"]:
+            if k in available_materials:
+                return available_materials[k]
+
+    # 12. FX & Lasers
+    if "laser_grid" in fname_lower:
+        for k in ["laser_grid_01", "laser_01"]:
+            if k in available_materials:
+                return available_materials[k]
+    if "laser" in fname_lower:
+        for k in ["laser_01"]:
+            if k in available_materials:
+                return available_materials[k]
+    if "fx_leaf" in fname_lower or "fx_leaves" in fname_lower:
+        for k in ["fx_leaves_01", "fx_leaves_02", "fx_leaves_03"]:
+            if k in available_materials:
+                return available_materials[k]
+    if "fx_lightray" in fname_lower:
+        for k in ["fx_lightray_01", "fx_lightray_02"]:
+            if k in available_materials:
+                return available_materials[k]
+    if "fx_fish" in fname_lower:
+        for k in ["fx_fish_pixel_01"]:
+            if k in available_materials:
+                return available_materials[k]
+    if "fx_gradient" in fname_lower:
+        for k in ["fx_gradient_01"]:
+            if k in available_materials:
+                return available_materials[k]
+
+    # 13. Parallax Buildings & Modular Blocks
+    if "sm_bld_block_" in fname_lower or "parallax" in fname_lower or "parallax" in slot_lower:
+        for k in ["parallax_full_01", "parallax_01", "parallax"]:
+            if k in available_materials:
+                return available_materials[k]
+
+    # 14. Walls, Bricks, Floors
+    if "wall" in slot_lower or "a_wall" in slot_lower or "brick" in slot_lower or "stucco" in slot_lower or "floor" in slot_lower:
         num_match = re.search(r"(\d+)", slot_name)
         if num_match:
             target_key = f"wall_{num_match.group(1).zfill(2)}"
-            if target_key in available_materials:
-                return available_materials[target_key]
+            for k in [f"{target_key}_a", f"{target_key}_b", target_key]:
+                if k in available_materials:
+                    return available_materials[k]
         for k, v in available_materials.items():
-            if "wall_01_a" in k or "wall" in k:
+            if "wall_01_a" in k or "wall" in k or "brick" in k or "floor" in k:
                 return v
+
+    # 15. Nature & Environment
+    if "tree" in slot_lower or "rock" in slot_lower or "mountain" in slot_lower or "water" in slot_lower:
+        for k, v in available_materials.items():
+            if any(term in k for term in ["tree", "rock", "mountain", "water", "nature"]):
+                return v
+
+    # 16. Specific pack alt textures if model stem specifies it (e.g. _01_B, _02_A, etc.)
+    for suffix in ["_01_b", "_01_c", "_02_a", "_02_b", "_02_c", "_03_a", "_03_b", "_03_c", "_04_a", "_04_b", "_04_c"]:
+        if fname_lower.endswith(suffix):
+            for k, v in available_materials.items():
+                if suffix[1:] in k:
+                    return v
 
     return default_atlas_mat
 
