@@ -189,6 +189,9 @@ def normalize_texture_imports(project_root: str) -> int:
                         content = f.read()
 
                     modified = False
+                    if "valid=false" in content:
+                        content = content.replace("valid=false\n", "").replace("valid=false", "")
+                        modified = True
                     if "compress/normal_map=2" in content or "compress/normal_map=1" in content:
                         content = re.sub(r"compress/normal_map=\d+", "compress/normal_map=0", content)
                         modified = True
