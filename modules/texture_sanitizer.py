@@ -29,6 +29,13 @@ EMBEDDED_ALIASES = {
 IGNORED_DIRS = {".godot", ".git", "node_modules"}
 
 
+def save_image_safe(img: Image.Image, target_path: str) -> None:
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    ext = os.path.splitext(target_path)[1].lower()
+    fmt = "PNG" if ext in [".png", ".psd"] else ("TGA" if ext == ".tga" else "JPEG")
+    img.save(target_path, format=fmt)
+
+
 def sanitize_texture_formats(project_root: str) -> int:
     fixed_count = 0
     image_extensions = {".png", ".tga", ".jpg", ".jpeg"}
@@ -84,12 +91,12 @@ def create_embedded_texture_aliases(project_root: str) -> int:
                     try:
                         if spec == "source_atlas" and cyber_atlas_path and os.path.exists(cyber_atlas_path):
                             with Image.open(cyber_atlas_path) as img:
-                                img.save(target_path)
+                                save_image_safe(img, target_path)
                             created_count += 1
                         elif isinstance(spec, tuple):
                             w, h, color = spec
                             img = Image.new("RGBA", (w, h), color)
-                            img.save(target_path)
+                            save_image_safe(img, target_path)
                             created_count += 1
                     except Exception:
                         pass
@@ -105,27 +112,65 @@ def create_embedded_texture_aliases(project_root: str) -> int:
     if not os.path.exists(apoc_main) and os.path.exists(source_apoc):
         os.makedirs(os.path.dirname(apoc_main), exist_ok=True)
         with Image.open(source_apoc) as img:
-            img.save(apoc_main)
+            save_image_safe(img, apoc_main)
         created_count += 1
 
     apoc_emissive = os.path.join(apocalypse_tex_dir, "PolygonApocalypse_Emissive_01.png")
     if not os.path.exists(apoc_emissive):
         img = Image.new("RGBA", (256, 256), (0, 0, 0, 255))
-        img.save(apoc_emissive)
+        save_image_safe(img, apoc_emissive)
         created_count += 1
 
     apoc_normal = os.path.join(apocalypse_tex_dir, "PolygonApocalypse_Normal.png")
     if not os.path.exists(apoc_normal):
         img = Image.new("RGBA", (256, 256), (128, 128, 255, 255))
-        img.save(apoc_normal)
+        save_image_safe(img, apoc_normal)
         created_count += 1
 
     sky_target = os.path.join(project_root, "Assets/AnimationBaseLocomotion/Samples/Meshes/SimpleSky.png")
     if not os.path.exists(sky_target):
         os.makedirs(os.path.dirname(sky_target), exist_ok=True)
         img = Image.new("RGBA", (256, 256), (135, 206, 235, 255))
-        img.save(sky_target)
+        save_image_safe(img, sky_target)
         created_count += 1
+
+    # Sidekick published texture stubs
+    sidekick_color_map = os.path.join(project_root, "Assets/Synty/SidekickCharacters/Resources/Textures/T_ColorMap.png")
+    sidekick_target_1 = os.path.join(project_root, "Assets/Synty/_SidekickCharacters/_published/_textures/Base_ColorLabels_01.png")
+    sidekick_target_2 = os.path.join(project_root, "Assets/Synty/_SidekickCharacters/_Textures/_Working/Base_Color_01.png")
+
+    for sk_target in [sidekick_target_1, sidekick_target_2]:
+        if not os.path.exists(sk_target):
+            os.makedirs(os.path.dirname(sk_target), exist_ok=True)
+            if os.path.exists(sidekick_color_map):
+                with Image.open(sidekick_color_map) as img:
+                    save_image_safe(img, sk_target)
+            else:
+                img = Image.new("RGBA", (512, 512), (200, 200, 200, 255))
+                save_image_safe(img, sk_target)
+            created_count += 1
+
+    # Dropbox workstation texture stubs
+    generic_atlas = os.path.join(project_root, "Assets/Synty/PolygonGeneric/Textures/PolygonGeneric_Texture_01_A.png")
+    dropbox_paths = [
+        os.path.join(project_root, "Dropbox/SyntyStudios/Polygon_Generic_Assets/_Working/_Textures/PolygonGeneric_Texture_01_A.psd"),
+        os.path.join(project_root, "Assets/Synty/Dropbox/SyntyStudios/Polygon_Generic_Assets/_Working/_Textures/PolygonGeneric_Texture_01_A.psd"),
+        os.path.join(project_root, "Dropbox/SyntyStudios/PolygonCyberCity/_Working/_Textures/PolygonCyberCity_Texture_01_A.psd"),
+        os.path.join(project_root, "Assets/Synty/Dropbox/SyntyStudios/PolygonCyberCity/_Working/_Textures/PolygonCyberCity_Texture_01_A.psd"),
+    ]
+    for db_target in dropbox_paths:
+        if not os.path.exists(db_target):
+            os.makedirs(os.path.dirname(db_target), exist_ok=True)
+            if os.path.exists(generic_atlas):
+                with Image.open(generic_atlas) as img:
+                    save_image_safe(img, db_target)
+            elif cyber_atlas_path and os.path.exists(cyber_atlas_path):
+                with Image.open(cyber_atlas_path) as img:
+                    save_image_safe(img, db_target)
+            else:
+                img = Image.new("RGBA", (512, 512), (200, 200, 200, 255))
+                save_image_safe(img, db_target)
+            created_count += 1
 
     return created_count
 
