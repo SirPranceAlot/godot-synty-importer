@@ -25,7 +25,7 @@ from modules.character_prefab_fixer import (
 from modules.uid_synchronizer import synchronize_scene_uids
 
 
-def run_pipeline(project_root: str, purge_cache: bool = True) -> None:
+def run_pipeline(project_root: str, purge_cache: bool = False) -> None:
     project_root = os.path.abspath(project_root)
     print("==================================================", flush=True)
     print("       Godot 4 Synty Asset Automation Tool        ", flush=True)
@@ -37,7 +37,7 @@ def run_pipeline(project_root: str, purge_cache: bool = True) -> None:
         sys.exit(1)
 
     # Step 1: Texture Sanitization & Repair
-    print("[1/5] Sanitizing Texture Files & Embedded Aliases...", flush=True)
+    print("[1/4] Sanitizing Texture Files & Embedded Aliases...", flush=True)
     fixed_tex = sanitize_texture_formats(project_root)
     created_aliases = create_embedded_texture_aliases(project_root)
     norm_tex = normalize_texture_imports(project_root)
@@ -46,7 +46,7 @@ def run_pipeline(project_root: str, purge_cache: bool = True) -> None:
     print(f"      - Normalized sRGB import settings: {norm_tex}", flush=True)
 
     # Step 2: FBX Binary Material Slot Mapping
-    print("\n[2/5] Scanning & Mapping FBX Internal Material Slots...", flush=True)
+    print("\n[2/4] Scanning & Mapping FBX Internal Material Slots...", flush=True)
     total_models = 0
     total_slots = 0
     synty_root = os.path.join(project_root, "Assets/Synty")
@@ -60,20 +60,20 @@ def run_pipeline(project_root: str, purge_cache: bool = True) -> None:
     print(f"      - Mapped {total_slots} material slots across {total_models} FBX models.", flush=True)
 
     # Step 3: Character Rig & Prefab Migration
-    print("\n[3/5] Rectifying Character Rigs & Mesh Visibility...", flush=True)
+    print("\n[3/4] Rectifying Character Rigs & Mesh Visibility...", flush=True)
     fixed_skels = fix_skeleton_paths(project_root)
     fixed_chars = configure_character_prefab_visibility(project_root)
     print(f"      - Updated GeneralSkeleton -> Skeleton3D in {fixed_skels} scenes/prefabs.", flush=True)
     print(f"      - Applied selective mesh visibility to {fixed_chars} character prefabs.", flush=True)
 
     # Step 4: UID Database Synchronization
-    print("\n[4/5] Synchronizing Scene & Resource UIDs...", flush=True)
+    print("\n[4/4] Synchronizing Scene & Resource UIDs...", flush=True)
     synced_scenes, fixed_uids = synchronize_scene_uids(project_root)
     print(f"      - Synchronized {fixed_uids} resource UIDs across {synced_scenes} scene files.", flush=True)
 
-    # Step 5: Cache Purge
+    # Optional: Cache Purge
     if purge_cache:
-        print("\n[5/5] Purging Stale Compiled Binary Cache...", flush=True)
+        print("\n[Optional] Purging Stale Compiled Binary Cache...", flush=True)
         imported_dir = os.path.join(project_root, ".godot/imported")
         purged = 0
         if os.path.exists(imported_dir):
@@ -101,13 +101,13 @@ def main():
         help="Path to the Godot project root (defaults to current directory).",
     )
     parser.add_argument(
-        "--no-purge-cache",
+        "--purge-cache",
         action="store_true",
-        help="Do not delete cached .scn files in .godot/imported.",
+        help="Delete cached .scn files in .godot/imported (forces full re-import).",
     )
     args = parser.parse_args()
 
-    run_pipeline(args.path, purge_cache=not args.no_purge_cache)
+    run_pipeline(args.path, purge_cache=args.purge_cache)
 
 
 if __name__ == "__main__":

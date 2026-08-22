@@ -4,7 +4,8 @@ FBX Material Slot Mapper Module
 1. Scans binary FBX files to detect internal Maya/3ds Max material slot names.
 2. Configures .fbx.import files with fbx/importer=0 (native ufbx) and attaches
    the post-import script.
-3. Generates _subresources blocks mapping every detected slot to a valid .tres material.
+3. Generates _subresources blocks mapping every detected slot to a valid .tres material
+   using nested brace depth tracking to prevent dangling parameters.
 """
 
 import os
@@ -120,6 +121,49 @@ def resolve_slot_material(
     return default_atlas_mat
 
 
+def clean_and_normalize_import_content(content: str, post_import_script: str) -> str:
+    """
+    Removes invalid flags, strips trailing/duplicate fbx parameters,
+    and removes old _subresources blocks using exact brace-depth counting.
+    """
+    # 1. Remove valid=false
+    content = content.replace("valid=false\n", "").replace("valid=false", "")
+
+    # 2. Remove all fbx/ lines so we can place fbx/importer=0 cleanly in [params]
+    content = re.sub(r"fbx/importer=\d+\n?", "", content)
+    content = re.sub(r"fbx/allow_geometry_helper_nodes=.*\n?", "", content)
+    content = re.sub(r"fbx/embedded_image_handling=.*\n?", "", content)
+    content = re.sub(r"fbx/naming_version=.*\n?", "", content)
+
+    # 3. Cleanly remove old _subresources block using proper brace depth
+    sub_idx = content.find("_subresources=")
+    if sub_idx != -1:
+        brace_start = content.find("{", sub_idx)
+        if brace_start != -1:
+            depth = 0
+            end_idx = len(content)
+            for i in range(brace_start, len(content)):
+                if content[i] == "{":
+                    depth += 1
+                elif content[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end_idx = i + 1
+                        break
+            content = content[:sub_idx].rstrip() + "\n" + content[end_idx:].lstrip()
+
+    # 4. Attach post-import script if missing
+    if 'import_script/path=""' in content:
+        content = content.replace('import_script/path=""', f'import_script/path="{post_import_script}"')
+
+    # 5. Insert fbx/importer=0 under [params]
+    params_idx = content.find("[params]")
+    if params_idx != -1:
+        content = content[:params_idx + 8] + "\nfbx/importer=0" + content[params_idx + 8:]
+
+    return content.strip()
+
+
 def map_pack_fbx_models(pack_dir: str, project_root: str) -> Tuple[int, int]:
     available_materials = find_pack_materials(pack_dir, project_root)
     pack_name = os.path.basename(pack_dir)
@@ -155,38 +199,17 @@ def map_pack_fbx_models(pack_dir: str, project_root: str) -> Tuple[int, int]:
                     )
                     total_slots += 1
 
-                materials_subresources = ',\n'.join(material_lines)
+                materials_subresources = ",\n".join(material_lines)
                 subresources_block = f'_subresources={{\n"materials": {{\n{materials_subresources}\n}}\n}}'
 
                 with open(import_path, "r", encoding="utf-8", errors="ignore") as fo:
-                    content = fo.read()
+                    raw_content = fo.read()
 
-                if "fbx/importer=1" in content:
-                    content = content.replace("fbx/importer=1", "fbx/importer=0")
-                elif "fbx/importer=" not in content:
-                    p_idx = content.find("[params]")
-                    if p_idx != -1:
-                        content = content[:p_idx + 8] + "\nfbx/importer=0" + content[p_idx + 8:]
-
-                if 'import_script/path=""' in content:
-                    content = content.replace('import_script/path=""', f'import_script/path="{post_import_script}"')
-
-                sub_start = content.find("_subresources=")
-                if sub_start != -1:
-                    in_sub = False
-                    sub_end = sub_start
-                    for idx in range(sub_start, len(content)):
-                        if content[idx] == "{":
-                            in_sub = True
-                        elif content[idx] == "}" and in_sub:
-                            sub_end = idx + 1
-                            break
-                    content = content[:sub_start] + subresources_block + content[sub_end:]
-                else:
-                    content += "\n" + subresources_block
+                cleaned_base = clean_and_normalize_import_content(raw_content, post_import_script)
+                final_content = cleaned_base + "\n\n" + subresources_block + "\n"
 
                 with open(import_path, "w", encoding="utf-8") as fo:
-                    fo.write(content)
+                    fo.write(final_content)
 
                 total_models += 1
 
