@@ -136,10 +136,21 @@ def create_embedded_texture_aliases(project_root: str) -> int:
 
     # Sidekick published texture stubs
     sidekick_color_map = os.path.join(project_root, "Assets/Synty/SidekickCharacters/Resources/Textures/T_ColorMap.png")
-    sidekick_target_1 = os.path.join(project_root, "Assets/Synty/_SidekickCharacters/_published/_textures/Base_ColorLabels_01.png")
-    sidekick_target_2 = os.path.join(project_root, "Assets/Synty/_SidekickCharacters/_Textures/_Working/Base_Color_01.png")
+    sidekick_targets = [
+        os.path.join(project_root, "Assets/Synty/_SidekickCharacters/_published/_textures/Base_ColorLabels_01.png"),
+        os.path.join(project_root, "Assets/Synty/_SidekickCharacters/_Textures/_Working/Base_Color_01.png"),
+        os.path.join(project_root, "Assets/Synty/_Working/Jordan/_textures/sci_fi_sold_01.png"),
+        os.path.join(project_root, "Assets/Synty/SidekickCharacters/Resources/Meshes/Outfits/ScifiSoldiers/Sci-fiSoldier_Color_01_Label.png"),
+        os.path.join(project_root, "Assets/Synty/SidekickCharacters/Resources/Meshes/Outfits/ScifiSoldiers/sci_fi_sold_01.png"),
+        os.path.join(project_root, "Assets/Synty/Dropbox/SyntyStudios_CharacterDesigner/_Working/Jordan/_textures/sci_fi_sold_01.png"),
+        os.path.join(project_root, "Dropbox/SyntyStudios_CharacterDesigner/_Working/Jordan/_textures/sci_fi_sold_01.png"),
+        os.path.join(project_root, "Assets/Synty/Dropbox/SyntyStudios_CharacterDesigner/_SidekickCharacters/_published/_textures/Base_ColorLabels_01.png"),
+        os.path.join(project_root, "Dropbox/SyntyStudios_CharacterDesigner/_SidekickCharacters/_published/_textures/Base_ColorLabels_01.png"),
+        os.path.join(project_root, "Assets/Synty/Dropbox/SyntyStudios_CharacterDesigner/_SidekickCharacters/_Textures/_Working/Base_Color_01.png"),
+        os.path.join(project_root, "Dropbox/SyntyStudios_CharacterDesigner/_SidekickCharacters/_Textures/_Working/Base_Color_01.png"),
+    ]
 
-    for sk_target in [sidekick_target_1, sidekick_target_2]:
+    for sk_target in sidekick_targets:
         if not os.path.exists(sk_target):
             os.makedirs(os.path.dirname(sk_target), exist_ok=True)
             if os.path.exists(sidekick_color_map):
