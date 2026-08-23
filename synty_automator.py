@@ -2,16 +2,17 @@
 """
 Godot Synty Importer & Automator
 ================================
-A comprehensive standalone tool and Godot 4 pipeline to automatically repair,
-map, configure, and optimize Synty asset packs in Godot 4.
+A comprehensive standalone tool and Godot 4 pipeline to automatically extract,
+repair, map, configure, and optimize Synty asset packs in Godot 4.
 
 Usage:
-    python3 synty_automator.py [--path /path/to/godot_project] [--purge-cache]
+    python3 synty_automator.py [--path /path/to/godot_project] [--package /path/to/Pack.unitypackage] [--purge-cache]
 """
 
 import argparse
 import os
 import sys
+from modules.unitypackage_extractor import extract_unitypackage
 from modules.texture_sanitizer import (
     sanitize_texture_formats,
     create_embedded_texture_aliases,
@@ -25,19 +26,29 @@ from modules.character_prefab_fixer import (
 from modules.uid_synchronizer import synchronize_scene_uids
 
 
-def run_pipeline(project_root: str, purge_cache: bool = False) -> None:
+def run_pipeline(project_root: str, package_path: str = None, purge_cache: bool = False) -> None:
     project_root = os.path.abspath(project_root)
     print("==================================================", flush=True)
     print("       Godot 4 Synty Asset Automation Tool        ", flush=True)
     print("==================================================", flush=True)
-    print(f"Target Project: {project_root}\n", flush=True)
+    print(f"Target Project: {project_root}", flush=True)
 
     if not os.path.exists(os.path.join(project_root, "project.godot")):
         print(f"ERROR: No project.godot found at '{project_root}'!", flush=True)
         sys.exit(1)
 
+    # Step 0: UnityPackage Extraction (if requested)
+    if package_path:
+        print(f"\n[0/4] Extracting UnityPackage: {os.path.basename(package_path)}...", flush=True)
+        try:
+            extracted_files, affected_packs = extract_unitypackage(package_path, project_root)
+            print(f"      - Extracted {extracted_files} assets across {len(affected_packs)} pack(s).", flush=True)
+        except Exception as e:
+            print(f"ERROR: Failed to extract package: {e}", flush=True)
+            sys.exit(1)
+
     # Step 1: Texture Sanitization & Repair
-    print("[1/4] Sanitizing Texture Files & Embedded Aliases...", flush=True)
+    print("\n[1/4] Sanitizing Texture Files & Embedded Aliases...", flush=True)
     fixed_tex = sanitize_texture_formats(project_root)
     created_aliases = create_embedded_texture_aliases(project_root)
     norm_tex = normalize_texture_imports(project_root)
@@ -101,13 +112,19 @@ def main():
         help="Path to the Godot project root (defaults to current directory).",
     )
     parser.add_argument(
+        "--package", "-pkg",
+        type=str,
+        default=None,
+        help="Optional path to a .unitypackage file to extract and import directly.",
+    )
+    parser.add_argument(
         "--purge-cache",
         action="store_true",
         help="Delete cached .scn files in .godot/imported (forces full re-import).",
     )
     args = parser.parse_args()
 
-    run_pipeline(args.path, purge_cache=args.purge_cache)
+    run_pipeline(args.path, package_path=args.package, purge_cache=args.purge_cache)
 
 
 if __name__ == "__main__":
