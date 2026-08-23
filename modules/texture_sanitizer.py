@@ -2,7 +2,7 @@
 Texture Sanitizer Module
 ------------------------
 1. Corrects image format mismatches via magic bytes.
-2. Generates dummy/alias texture files for hardcoded workstation paths in FBX binaries.
+2. Purges invalid .psd files and provisions valid image aliases.
 3. Normalizes texture import settings.
 """
 
@@ -12,26 +12,35 @@ from PIL import Image
 
 IGNORED_DIRS = {".godot", ".git", "node_modules"}
 
-EMBEDDED_ALIASES = {
-    "targetUV_texture.psd": (512, 512, (200, 200, 200, 255)),
-    "PolygonCyberCity_Texture_01_A.psd": "atlas",
-    "PolygonGeneric_Texture_01_A.psd": "atlas",
-    "Wire_Alpha 1.tga": (512, 512, (255, 255, 255, 255)),
-    "Glass.psd": (512, 512, (255, 255, 255, 100)),
-}
+VALID_IMAGE_EXTS = {".png", ".tga", ".jpg", ".jpeg", ".webp"}
 
 
 def save_image_safe(img: Image.Image, target_path: str) -> None:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     ext = os.path.splitext(target_path)[1].lower()
-    fmt = "PNG" if ext in [".png", ".psd"] else ("TGA" if ext == ".tga" else "JPEG")
+    fmt = "PNG" if ext == ".png" else ("TGA" if ext == ".tga" else "JPEG")
     img.save(target_path, format=fmt)
 
 
 def sanitize_texture_formats(project_root: str) -> int:
     fixed_count = 0
-    ext_to_fmt = {".png": ("PNG", b"\x89PNG\r\n\x1a\n"), ".jpg": ("JPEG", b"\xff\xd8\xff"), ".jpeg": ("JPEG", b"\xff\xd8\xff")}
+    ext_to_fmt = {
+        ".png": ("PNG", b"\x89PNG\r\n\x1a\n"),
+        ".jpg": ("JPEG", b"\xff\xd8\xff"),
+        ".jpeg": ("JPEG", b"\xff\xd8\xff")
+    }
 
+    # 1. Clean up invalid dummy .psd files from project
+    for root, dirs, files in os.walk(project_root):
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+        for f in files:
+            if f.endswith(".psd") or f.endswith(".psd.import"):
+                try:
+                    os.remove(os.path.join(root, f))
+                except Exception:
+                    pass
+
+    # 2. Fix magic bytes format mismatches
     for root, dirs, files in os.walk(project_root):
         dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
         for f in files:
@@ -58,7 +67,6 @@ def sanitize_texture_formats(project_root: str) -> int:
 
 def create_embedded_texture_aliases(project_root: str) -> int:
     created = 0
-    # Locate atlas textures for cloning
     atlases = {}
     for root, dirs, files in os.walk(project_root):
         dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
@@ -73,25 +81,7 @@ def create_embedded_texture_aliases(project_root: str) -> int:
 
     default_atlas = atlases.get("cyber") or atlases.get("generic") or next(iter(atlases.values()), None)
 
-    # 1. Models folder aliases
-    for root, dirs, files in os.walk(project_root):
-        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
-        if os.path.basename(root) in ["Models", "Base"] and "Synty" in root:
-            for name, spec in EMBEDDED_ALIASES.items():
-                target = os.path.join(root, name)
-                if not os.path.exists(target):
-                    try:
-                        if spec == "atlas" and default_atlas:
-                            with Image.open(default_atlas) as img:
-                                save_image_safe(img, target)
-                        elif isinstance(spec, tuple):
-                            img = Image.new("RGBA", (spec[0], spec[1]), spec[2])
-                            save_image_safe(img, target)
-                        created += 1
-                    except Exception:
-                        pass
-
-    # 2. Known external Dropbox & internal path stubs
+    # Known required image aliases (PNG/TGA only, never PSD)
     stubs = [
         "Assets/PolygonApocalypse/Textures/PolygonApocalypse_Texture_01_A 1.png",
         "Assets/PolygonApocalypse/Textures/Misc/PolygonApocalypse_Emissive_01.png",
@@ -108,10 +98,6 @@ def create_embedded_texture_aliases(project_root: str) -> int:
         "Dropbox/SyntyStudios_CharacterDesigner/_SidekickCharacters/_published/_textures/Base_ColorLabels_01.png",
         "Assets/Synty/Dropbox/SyntyStudios_CharacterDesigner/_SidekickCharacters/_Textures/_Working/Base_Color_01.png",
         "Dropbox/SyntyStudios_CharacterDesigner/_SidekickCharacters/_Textures/_Working/Base_Color_01.png",
-        "Dropbox/SyntyStudios/Polygon_Generic_Assets/_Working/_Textures/PolygonGeneric_Texture_01_A.psd",
-        "Assets/Synty/Dropbox/SyntyStudios/Polygon_Generic_Assets/_Working/_Textures/PolygonGeneric_Texture_01_A.psd",
-        "Dropbox/SyntyStudios/PolygonCyberCity/_Working/_Textures/PolygonCyberCity_Texture_01_A.psd",
-        "Assets/Synty/Dropbox/SyntyStudios/PolygonCyberCity/_Working/_Textures/PolygonCyberCity_Texture_01_A.psd",
     ]
 
     for rel in stubs:

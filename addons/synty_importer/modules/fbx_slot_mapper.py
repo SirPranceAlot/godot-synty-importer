@@ -149,7 +149,7 @@ def clean_and_normalize_import(content: str) -> str:
     content = re.sub(r'import_script/path="[^"]*"', 'import_script/path=""', content)
     params_idx = content.find("[params]")
     if params_idx != -1:
-        content = content[:params_idx + 8] + "\nfbx/importer=0" + content[params_idx + 8:]
+        content = content[:params_idx + 8] + "\nfbx/importer=0\nfbx/embedded_image_handling=0" + content[params_idx + 8:]
 
     return content.strip()
 
