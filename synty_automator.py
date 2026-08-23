@@ -61,7 +61,7 @@ SLOT_RULES = [
     ("fx_lightray", ["fx_lightray_01", "fx_lightray_02"]),
     ("fx_fish", ["fx_fish_pixel_01"]),
     ("fx_gradient", ["fx_gradient_01"]),
-    ("sm_bld_block_", ["parallax_full_01", "parallax_01", "parallax"]),
+    ("sm_bld_block_", ["wall_01_triplanar", "wall_01_alt_01_triplanar", "wall_01_a"]),
     ("parallax", ["parallax_full_01", "parallax_01", "parallax"]),
 ]
 
@@ -188,7 +188,35 @@ def sanitize_textures_and_stubs(project_root: str, categorized_files: Dict[str, 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         norm = sum(ex.map(check_texture_import, tex_imports))
 
-    # 3. Required legacy texture aliases
+    # 3. Triplanar material normalizer (enables world-triplanar projection)
+    def check_triplanar_material(p):
+        if "triplanar" not in p.lower():
+            return 0
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                txt = fh.read()
+            mod = False
+            if "uv1_triplanar = false" in txt:
+                txt = txt.replace("uv1_triplanar = false", "uv1_triplanar = true")
+                mod = True
+            if "uv1_world_triplanar = false" in txt:
+                txt = txt.replace("uv1_world_triplanar = false", "uv1_world_triplanar = true")
+                mod = True
+            if "uv1_scale = Vector3(1, 1, 1)" in txt:
+                txt = txt.replace("uv1_scale = Vector3(1, 1, 1)", "uv1_scale = Vector3(0.5, 0.5, 0.5)")
+                mod = True
+            if mod:
+                with open(p, "w", encoding="utf-8") as fh:
+                    fh.write(txt)
+                return 1
+        except Exception:
+            pass
+        return 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        list(ex.map(check_triplanar_material, categorized_files.get("materials", [])))
+
+    # 4. Required legacy texture aliases
     stubs = [
         "Assets/PolygonApocalypse/Textures/PolygonApocalypse_Texture_01_A 1.png",
         "Assets/PolygonApocalypse/Textures/Misc/PolygonApocalypse_Emissive_01.png",
@@ -385,6 +413,21 @@ def fix_character_rigs_and_visibility(categorized_files: Dict[str, List[str]]) -
         fixed_skels = sum(ex.map(process_tscn, categorized_files.get("tscn", [])))
 
     def process_prefab(p):
+        if "SM_Bld_Block_" in p:
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                    txt = fh.read()
+                if "Parallax_Full_01.mat.tres" in txt or "doomlgele8hgg" in txt:
+                    txt = txt.replace("res://Assets/Synty/PolygonCyberCity/Materials/Building/Parallax/Parallax_Full_01.mat.tres",
+                                      "res://Assets/Synty/PolygonCyberCity/Materials/Building/Triplanar_Buildings/Wall_01_Triplanar.mat.tres")
+                    txt = txt.replace("uid://doomlgele8hgg", "uid://bb4vllkdpsq0r")
+                    with open(p, "w", encoding="utf-8") as fh:
+                        fh.write(txt)
+                    return 1
+            except Exception:
+                pass
+            return 0
+
         if "/Characters/" not in p.replace("\\", "/"):
             return 0
         stem = os.path.basename(p).split(".")[0]
