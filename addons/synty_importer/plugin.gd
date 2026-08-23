@@ -41,17 +41,39 @@ func _run_automator(extra_args: Array) -> void:
 	if not FileAccess.file_exists(script_path):
 		script_path = project_path.path_join("synty_automator.py")
 	
-	if FileAccess.file_exists(script_path):
-		var args: Array = [script_path, "--path", project_path]
-		args.append_array(extra_args)
-		
-		var output: Array = []
-		var exit_code: int = OS.execute("python3", args, output, true)
-		print("".join(output))
-		if exit_code == 0:
-			print("Synty assets configured successfully! Reloading project...")
-			EditorInterface.restart_editor(true)
-		else:
-			printerr("Synty automator finished with exit code: ", exit_code)
+	if not FileAccess.file_exists(script_path):
+		_show_error("Script Not Found", "synty_automator.py could not be found at:\n" + script_path)
+		return
+
+	var args: Array = [script_path, "--path", project_path]
+	args.append_array(extra_args)
+	
+	var output: Array = []
+	var exit_code: int = OS.execute("python3", args, output, true)
+	if exit_code == -1 or (exit_code != 0 and OS.get_name() == "Windows"):
+		var fallback_output: Array = []
+		var fallback_code: int = OS.execute("python", args, fallback_output, true)
+		if fallback_code == 0 or output.is_empty():
+			exit_code = fallback_code
+			output = fallback_output
+	
+	var out_str: String = "".join(output)
+	print(out_str)
+	
+	if exit_code == 0:
+		print("Synty assets configured successfully! Reloading project...")
+		EditorInterface.restart_editor(true)
+	elif exit_code == -1:
+		_show_error("Python Not Found", "Python 3 was not found in your system PATH.\nPlease install Python 3.8+ and verify it is available as 'python' or 'python3'.")
 	else:
-		printerr("synty_automator.py not found at: ", script_path)
+		_show_error("Automator Error", "Synty automator finished with exit code %d.\n\n%s" % [exit_code, out_str])
+
+func _show_error(title: String, message: String) -> void:
+	printerr(title, ": ", message)
+	var dialog: AcceptDialog = AcceptDialog.new()
+	dialog.title = title
+	dialog.dialog_text = message
+	dialog.confirmed.connect(dialog.queue_free)
+	dialog.canceled.connect(dialog.queue_free)
+	EditorInterface.get_base_control().add_child(dialog)
+	dialog.popup_centered()

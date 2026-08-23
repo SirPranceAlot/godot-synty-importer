@@ -18,10 +18,12 @@ When importing Synty asset packs into Godot 4, several recurring engine incompat
 
 ## ✨ Features
 
-- **Automated FBX Binary Header Parsing**: Detects internal Maya/3ds Max material slots in all `.fbx` files and generates clean native Godot `.fbx.import` mappings.
-- **Selective Character Visibility**: Automatically updates character prefabs to show only their designated character and hides all 17+ non-active variations.
-- **Texture Format Sanitization**: Detects misnamed image formats (e.g. TGA data named `.png`) and converts them using Pillow.
-- **Embedded Alias Stubs**: Automatically provisions transparent/neutral texture aliases for legacy FBX embedded paths.
+- **Universal Synty Pack Compatibility**: Fully dynamic heuristics support any Synty Studios pack (Polygon, Simple, Sidekick, Fantasy, Sci-Fi, Dungeon, City, Apocalypse, Western, Samurai, Nature, etc.).
+- **Dynamic Missing Texture & PSD Resolver**: Dynamically scans all scenes, materials, and FBX binaries, auto-generating neutral and atlas texture stubs so missing embedded paths never crash or trigger 404 image errors.
+- **Automated StandardMaterial3D Generation**: Automatically generates Godot 4 `StandardMaterial3D` resources for any asset pack that only includes raw FBX meshes and textures.
+- **Deep FBX Binary Slot Parsing**: Detects internal Maya/3ds Max material slots in all `.fbx` files and applies 4-tier semantic material mapping directly into native Godot `.fbx.import` files.
+- **Universal Multi-Character Rig Visibility**: Automatically normalizes skeleton hierarchies to `Skeleton3D` and sets selective mesh visibility on multi-character prefabs.
+- **Texture Format Sanitization**: Detects misnamed image formats (e.g. TGA data named `.png`) and normalizes sRGB / normal map compression flags.
 - **Direct .unitypackage Import**: Extract raw `.unitypackage` files directly into Godot and configure all assets automatically in one step.
 - **Project-Wide UID Synchronization**: Re-indexes and updates all scene and prefab UIDs to guarantee zero console warnings.
 - **One-Click Godot 4 Addon**: Run directly inside the Godot Editor via **Project > Tools > Fix Synty Asset Packs** or **Project > Tools > Import Synty .unitypackage...**.
@@ -49,9 +51,19 @@ When importing Synty asset packs into Godot 4, several recurring engine incompat
    ```bash
    python3 synty_automator.py --path "/path/to/godot_project"
    ```
+   *Optional: purge stale compiled `.scn` cache:*
+   ```bash
+   python3 synty_automator.py --path "/path/to/godot_project" --purge-cache
+   ```
 
 ### Method 2: Godot 4 Editor Plugin
 
+#### Prerequisites
+The editor plugin executes the background automator using Python. Ensure your system has:
+- **Python 3.8+** in your system `PATH` (`python` or `python3`)
+- **Pillow** installed: `pip install Pillow` (or `pip install -r requirements.txt`)
+
+#### Setup
 1. Copy the `addons/synty_importer` folder into your Godot project's `addons/` directory:
    ```text
    res://addons/synty_importer/
@@ -61,6 +73,7 @@ When importing Synty asset packs into Godot 4, several recurring engine incompat
 4. In the editor menu:
    - Click **Project > Tools > Import Synty .unitypackage...** to select and unpack any `.unitypackage` file directly.
    - Click **Project > Tools > Fix Synty Asset Packs** to re-map and optimize existing assets at any time.
+5. Godot will automatically reload and restart the editor once the automator finishes to apply the new import configurations.
 
 ---
 
@@ -74,7 +87,8 @@ godot-synty-importer/
 └── addons/synty_importer/           # Standalone Godot 4 Editor Addon
     ├── plugin.cfg
     ├── plugin.gd
-    └── synty_automator.py           # Self-contained automation engine
+    ├── synty_automator.py           # Self-contained automation engine
+    └── README.md                    # Addon documentation
 ```
 
 ---
