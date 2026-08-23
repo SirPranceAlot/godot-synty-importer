@@ -42,67 +42,27 @@ PNG_1X1_BYTES = (
     b"\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82"
 )
 
-# Universal fallback material slots found across Maya/3ds Max Synty exports
-FALLBACK_SLOTS = [
-    "default", "Base_Lambert", "lambert", "lambert1", "standardSurface1",
-    "MAT_01A", "MAT_01B", "COLOR", "Polygon", "Polygon_Generic_01A",
-    "Scifi_Cybercity_Main", "custom_lambert", "pasted__lambert4SG3",
-    "roboguy_lambert4SG3", "roboguy_lambert4SG11", "roboguy_lambert4SG12",
-    "roboguy_lambert4SG13", "roboguy_lambert4SG14", "roboguy_lambert4SG15",
-    "roboguy_lambert4SG16", "roboguy_lambert4SG17", "roboguy_lambert4SG18",
-    "roboguy_lambert4SG19", "roboguy_lambert4SG6"
-]
-
-# Universal Semantic Tag-to-Candidate rules
-SEMANTIC_RULES = [
-    # Holograms, Signs & Billboards
-    ("target_hologram", ["hologram_targets_01", "hologram_targets", "hologram_01"]),
-    ("holotarget", ["hologram_targets_01", "hologram_01"]),
-    ("holo_sign", ["hologram_signs_01", "hologram_signs", "hologram_01"]),
-    ("holosign", ["hologram_signs_01", "hologram_signs", "hologram_01"]),
-    ("holo_poster", ["hologram_posters_01_a", "hologram_posters_01_b", "hologram_01"]),
-    ("holo_text", ["hologram_text_01", "hologram_01"]),
-    ("hologram_tree", ["hologram_01", "hologram_basic_01_a"]),
-    ("hologram_cherry_tree", ["hologram_01", "hologram_basic_01_a"]),
-    ("hologram", ["hologram_01", "hologram_basic_01_a"]),
-    ("holo", ["hologram_01", "hologram_basic_01_a"]),
-    ("poster", ["posters_01", "poster_01", "papers_01"]),
-    ("damaged_sign", ["billboard_01_damaged", "billboard_02_damaged", "billboard_01_a"]),
-    ("billboard_damaged", ["billboard_01_damaged", "billboard_02_damaged", "billboard_01_a"]),
-    ("billboard_sign_small", ["billboard_03", "billboard_01_a"]),
-    ("billboard_backing_small", ["billboard_03", "billboard_01_a"]),
-    ("billboard", ["billboard_01_a", "billboard_02_a", "billboard_03"]),
-    ("neonsign", ["signs_01", "billboard_03", "billboard_01_a"]),
-    ("sign", ["signs_01", "billboard_03", "billboard_01_a"]),
-    ("screen", ["screen_01", "monitor_01", "display_01"]),
+# Unified Semantic Category-to-Keyword mappings for dynamic material discovery
+SEMANTIC_CATEGORIES = [
+    # Holograms & UI
+    (["holo", "hologram"], ["hologram", "holo"]),
+    # Signs, Displays & Billboards
+    (["billboard", "neonsign", "sign", "poster", "screen", "monitor", "display"], ["billboard", "sign", "poster", "screen", "display", "paper"]),
     # Glass & Transparency
-    ("glass", ["glass_01_a", "glass_transparent_01", "glass_01", "glass", "m_glass"]),
-    ("window", ["glass_01_a", "glass_01", "window_01"]),
-    ("water", ["water_01", "waterfall_01", "fx_water_01"]),
-    ("ice", ["ice_01", "crystal_01", "glass_01"]),
-    # Debris & Trash
-    ("trash", ["trash_01", "junk_01"]),
-    ("junk_large", ["junk_large_01", "junk_01"]),
-    ("junk", ["junk_01"]),
-    # FX & Beams
-    ("laser_grid", ["laser_grid_01", "laser_01"]),
-    ("laser", ["laser_01", "fx_laser_01"]),
-    ("fx_leaf", ["fx_leaves_01", "fx_leaves_02", "fx_leaves_03"]),
-    ("fx_leaves", ["fx_leaves_01", "fx_leaves_02", "fx_leaves_03"]),
-    ("fx_lightray", ["fx_lightray_01", "fx_lightray_02"]),
-    ("fx_fish", ["fx_fish_pixel_01"]),
-    ("fx_gradient", ["fx_gradient_01"]),
-    ("fx_sunbeam", ["fx_sunbeam_01", "fx_lightray_01"]),
-    ("fx_sparkle", ["fx_sparkle_01"]),
-    ("fx_streak", ["fx_streaks_01"]),
-    ("fx_", ["fx_01", "fx_particles_01"]),
-    # Modular Walls & Triplanar
-    ("sm_bld_block_", ["wall_01_triplanar", "wall_01_alt_01_triplanar", "wall_01_a", "building_01"]),
-    ("triplanar", ["wall_01_triplanar", "wall_01_a", "ground_01"]),
-    ("parallax", ["parallax_full_01", "parallax_01", "parallax"]),
-    # Sky & Environment
-    ("skybox", ["skybox_01", "skybox_02", "sky_01"]),
-    ("skydome", ["skydome_01", "sky_01", "simplesky"]),
+    (["glass", "window", "transparent"], ["glass", "window", "transparent"]),
+    # Fluids, Crystals & Ice
+    (["water", "waterfall", "fluid"], ["water", "waterfall", "fx_water"]),
+    (["ice", "crystal"], ["ice", "crystal", "glass"]),
+    # Debris & Waste
+    (["trash", "junk", "debris", "rubble"], ["trash", "junk"]),
+    # Special Effects & Beams
+    (["laser", "laser_grid"], ["laser"]),
+    (["fx_", "fx", "sparkle", "lightray", "sunbeam", "streak"], ["fx", "leaves", "lightray", "particle", "gradient"]),
+    # Environment, Skies & Modular Architecture
+    (["skybox", "skydome", "sky"], ["skybox", "skydome", "simplesky", "sky"]),
+    (["triplanar", "sm_bld_block", "parallax"], ["triplanar", "wall", "ground", "parallax"]),
+    (["wall", "a_wall", "brick", "stucco", "floor", "building"], ["wall", "brick", "floor", "building"]),
+    (["tree", "rock", "mountain", "nature", "wood", "foliage", "bark", "leaf"], ["tree", "rock", "mountain", "water", "nature", "wood"]),
 ]
 
 # Precompiled Regexes for High-Performance Parsing
@@ -397,7 +357,7 @@ def extract_fbx_material_slots(fbx_path: str) -> Set[str]:
     slots = set()
     try:
         with open(fbx_path, "rb") as fh:
-            data = fh.read(1024 * 1024)
+            data = fh.read()
         for rx in (RE_FBX_MAT1, RE_FBX_MAT2, RE_FBX_MAT5):
             for m in rx.findall(data):
                 slots.add(m.decode("ascii", errors="ignore"))
@@ -407,8 +367,8 @@ def extract_fbx_material_slots(fbx_path: str) -> Set[str]:
     except Exception:
         pass
 
-    slots.update(FALLBACK_SLOTS)
-    return {s for s in slots if len(s) >= 2 and not s.startswith(" ")}
+    clean_slots = {s for s in slots if len(s) >= 2 and not s.startswith(" ")}
+    return clean_slots if clean_slots else {"default", "lambert1", "standardSurface1"}
 
 
 def resolve_slot_material(slot: str, fbx_name: str, mats: Dict[str, str], default_atlas: str) -> str:
@@ -419,7 +379,7 @@ def resolve_slot_material(slot: str, fbx_name: str, mats: Dict[str, str], defaul
     if s_low in mats:
         return mats[s_low]
 
-    # Tier 2: Normalized Name Match (strip Maya/Max prefixes and suffixes)
+    # Tier 2: Normalized Name Match (strip DCC prefixes and suffixes)
     norm_slot = RE_CLEAN_PREFIX.sub("", s_low)
     norm_slot = RE_CLEAN_SUFFIX.sub("", norm_slot)
     if norm_slot in mats:
@@ -428,39 +388,32 @@ def resolve_slot_material(slot: str, fbx_name: str, mats: Dict[str, str], defaul
         if norm_slot in k or k in norm_slot:
             return v
 
-    # Tier 3: Universal Semantic Category Matching
-    for tag, candidates in SEMANTIC_RULES:
-        if tag in s_low or tag in f_low:
-            for cand in candidates:
-                if cand in mats:
-                    return mats[cand]
-                for k, v in mats.items():
-                    if cand in k:
-                        return v
-
-    if any(k in s_low for k in ["wall", "a_wall", "brick", "stucco", "floor", "building"]):
+    # Tier 3: Dynamic Numbered Wall/Building Slot Matcher (e.g. A_Wall14 -> wall_14)
+    if any(term in s_low for term in ["wall", "brick", "building"]):
         num_m = RE_NUM_EXT.search(slot)
         if num_m:
             target_key = f"wall_{num_m.group(1).zfill(2)}"
             for k in [f"{target_key}_a", f"{target_key}_b", target_key]:
                 if k in mats:
                     return mats[k]
-        for k, v in mats.items():
-            if any(term in k for term in ["wall_01_a", "wall", "brick", "floor", "building"]):
-                return v
 
-    if any(k in s_low for k in ["tree", "rock", "mountain", "water", "wood", "nature"]):
-        for k, v in mats.items():
-            if any(term in k for term in ["tree", "rock", "mountain", "water", "nature", "wood"]):
-                return v
+    # Tier 4: Dynamic Category & Keyword Intersection Matching
+    combined_name = f"{f_low}_{s_low}"
+    for mesh_tags, mat_keywords in SEMANTIC_CATEGORIES:
+        if any(tag in combined_name for tag in mesh_tags):
+            for kw in mat_keywords:
+                for k, v in mats.items():
+                    if kw in k:
+                        return v
 
+    # Tier 5: Asset Color Variant Suffix Matching (e.g. model ending in _01_b -> material with 01_b)
     for sfx in ["_01_b", "_01_c", "_02_a", "_02_b", "_02_c", "_03_a", "_03_b", "_03_c", "_04_a", "_04_b", "_04_c"]:
         if f_low.endswith(sfx):
             for k, v in mats.items():
                 if sfx[1:] in k:
                     return v
 
-    # Tier 4: Pack Default Color Atlas
+    # Tier 6: Pack Default Color Atlas
     return default_atlas
 
 
@@ -684,7 +637,7 @@ def collect_project_files(project_root: str) -> Dict[str, List[str]]:
                 categorized["tscn"].append(full_path)
             elif f.endswith(".import"):
                 categorized["imports"].append(full_path)
-            elif f.endswith((".mat.tres", ".tres")) and not f.endswith(".mesh"):
+            elif f.endswith(".mat.tres") or (f.endswith(".tres") and not f.endswith((".mesh.tres", ".animation.tres", ".skin.tres", ".skeleton.tres"))):
                 categorized["materials"].append(full_path)
             elif os.path.splitext(f)[1].lower() in image_exts:
                 categorized["images"].append(full_path)
