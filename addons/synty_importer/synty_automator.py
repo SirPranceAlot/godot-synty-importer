@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Godot Synty Importer & Automator (Unified Single-File Tool)
-==========================================================
+Godot Synty Importer & Automator (Streamlined Engine)
+===================================================
 Automates extraction, texture repair, Maya/Max material slot mapping,
 multi-character rig visibility, and UID synchronization for Synty asset packs in Godot 4.
 
@@ -30,30 +30,50 @@ FALLBACK_SLOTS = [
 ]
 
 SLOT_RULES = [
-    (lambda s, f: "target_hologram" in f or "holotarget" in s or ("target" in s and "holo" in f), ["hologram_targets_01", "hologram_targets", "hologram_01"]),
-    (lambda s, f: "holo_sign" in f or "holosign" in s, ["hologram_signs_01", "hologram_signs", "hologram_01"]),
-    (lambda s, f: "holo_poster" in f, ["hologram_posters_01_a", "hologram_posters_01_b", "hologram_01"]),
-    (lambda s, f: "holo_text" in f, ["hologram_text_01", "hologram_01"]),
-    (lambda s, f: "hologram_tree" in f or "hologram_cherry_tree" in f, ["hologram_01", "hologram_basic_01_a"]),
-    (lambda s, f: ("hologram_stand" in f or "hologram_table" in f or "holo_planter" in f) and ("holo" in s or "screen" in s), ["hologram_01", "hologram_basic_01_a"]),
-    (lambda s, f: "holo" in s or "hologram" in s, ["hologram_01", "hologram_basic_01_a"]),
-    (lambda s, f: "poster" in f or "poster" in s or "papers" in s, ["posters_01", "poster_01", "papers_01"]),
-    (lambda s, f: "damaged_sign" in f or "billboard_damaged" in f, ["billboard_01_damaged", "billboard_02_damaged", "billboard_01_a"]),
-    (lambda s, f: "billboard_sign_small" in f or "billboard_backing_small" in f, ["billboard_03", "billboard_01_a"]),
-    (lambda s, f: "billboard" in f or "billboard" in s, ["billboard_01_a", "billboard_02_a", "billboard_03"]),
-    (lambda s, f: "neonsign" in f or "sign" in f or "sign" in s, ["signs_01", "billboard_03", "billboard_01_a"]),
-    (lambda s, f: "glass" in s or "glass" in f, ["glass_01_a", "glass_transparent_01", "glass_01", "glass"]),
-    (lambda s, f: "trash" in s or "trash" in f, ["trash_01", "junk_01"]),
-    (lambda s, f: "junk_large" in f, ["junk_large_01", "junk_01"]),
-    (lambda s, f: "junk" in f, ["junk_01"]),
-    (lambda s, f: "laser_grid" in f, ["laser_grid_01", "laser_01"]),
-    (lambda s, f: "laser" in f, ["laser_01"]),
-    (lambda s, f: "fx_leaf" in f or "fx_leaves" in f, ["fx_leaves_01", "fx_leaves_02", "fx_leaves_03"]),
-    (lambda s, f: "fx_lightray" in f, ["fx_lightray_01", "fx_lightray_02"]),
-    (lambda s, f: "fx_fish" in f, ["fx_fish_pixel_01"]),
-    (lambda s, f: "fx_gradient" in f, ["fx_gradient_01"]),
-    (lambda s, f: "sm_bld_block_" in f or "parallax" in f or "parallax" in s, ["parallax_full_01", "parallax_01", "parallax"]),
+    ("target_hologram", ["hologram_targets_01", "hologram_targets", "hologram_01"]),
+    ("holotarget", ["hologram_targets_01", "hologram_01"]),
+    ("holo_sign", ["hologram_signs_01", "hologram_signs", "hologram_01"]),
+    ("holosign", ["hologram_signs_01", "hologram_01"]),
+    ("holo_poster", ["hologram_posters_01_a", "hologram_posters_01_b", "hologram_01"]),
+    ("holo_text", ["hologram_text_01", "hologram_01"]),
+    ("hologram_tree", ["hologram_01", "hologram_basic_01_a"]),
+    ("hologram_cherry_tree", ["hologram_01", "hologram_basic_01_a"]),
+    ("hologram", ["hologram_01", "hologram_basic_01_a"]),
+    ("holo", ["hologram_01", "hologram_basic_01_a"]),
+    ("poster", ["posters_01", "poster_01", "papers_01"]),
+    ("damaged_sign", ["billboard_01_damaged", "billboard_02_damaged", "billboard_01_a"]),
+    ("billboard_damaged", ["billboard_01_damaged", "billboard_02_damaged", "billboard_01_a"]),
+    ("billboard_sign_small", ["billboard_03", "billboard_01_a"]),
+    ("billboard_backing_small", ["billboard_03", "billboard_01_a"]),
+    ("billboard", ["billboard_01_a", "billboard_02_a", "billboard_03"]),
+    ("neonsign", ["signs_01", "billboard_03", "billboard_01_a"]),
+    ("sign", ["signs_01", "billboard_03", "billboard_01_a"]),
+    ("glass", ["glass_01_a", "glass_transparent_01", "glass_01", "glass"]),
+    ("trash", ["trash_01", "junk_01"]),
+    ("junk_large", ["junk_large_01", "junk_01"]),
+    ("junk", ["junk_01"]),
+    ("laser_grid", ["laser_grid_01", "laser_01"]),
+    ("laser", ["laser_01"]),
+    ("fx_leaf", ["fx_leaves_01", "fx_leaves_02", "fx_leaves_03"]),
+    ("fx_leaves", ["fx_leaves_01", "fx_leaves_02", "fx_leaves_03"]),
+    ("fx_lightray", ["fx_lightray_01", "fx_lightray_02"]),
+    ("fx_fish", ["fx_fish_pixel_01"]),
+    ("fx_gradient", ["fx_gradient_01"]),
+    ("sm_bld_block_", ["parallax_full_01", "parallax_01", "parallax"]),
+    ("parallax", ["parallax_full_01", "parallax_01", "parallax"]),
 ]
+
+# Pre-compiled regular expressions for high throughput
+RE_FBX_MAT1 = re.compile(b"([a-zA-Z0-9_-]+)\x00\x01Material")
+RE_FBX_MAT2 = re.compile(b"Material::([a-zA-Z0-9_-]+)")
+RE_FBX_MAT3 = re.compile(b"Material[\x00-\x10]+([a-zA-Z0-9_ -]{2,40})[\x00-\x10]+(?:FbxSurfaceLambert|FbxSurfacePhong|Material)")
+RE_FBX_MAT4 = re.compile(b"([a-zA-Z0-9_ -]{2,40})\x00\x01(?:FbxSurfaceLambert|FbxSurfacePhong)")
+RE_FBX_MAT5 = re.compile(b"Material\x00+([a-zA-Z0-9_-]+)")
+RE_FBX_LINES = re.compile(r"fbx/(?:importer|allow_geometry_helper_nodes|embedded_image_handling|naming_version)=.*\n?")
+RE_EXT_PATH = re.compile(r'path="([^"]+)"')
+RE_EXT_UID = re.compile(r'uid="([^"]+)"')
+RE_SRC_FILE = re.compile(r'source_file="([^"]+)"')
+RE_NUM_EXT = re.compile(r"(\d+)")
 
 
 # ==============================================================================
@@ -105,7 +125,6 @@ def sanitize_textures_and_stubs(project_root: str, all_files: List[str]) -> Tupl
     fixed = aliases = norm = 0
     ext_to_fmt = {".png": b"\x89PNG\r\n\x1a\n", ".jpg": b"\xff\xd8\xff", ".jpeg": b"\xff\xd8\xff"}
 
-    # Find color atlases for cloning
     atlases = {}
     for p in all_files:
         low = os.path.basename(p).lower()
@@ -118,7 +137,6 @@ def sanitize_textures_and_stubs(project_root: str, all_files: List[str]) -> Tupl
 
     default_atlas = atlases.get("cyber") or atlases.get("generic") or next(iter(atlases.values()), None)
 
-    # 1. Format check and .psd purge
     for p in all_files:
         ext = os.path.splitext(p)[1].lower()
         if ext == ".psd" or p.endswith(".psd.import"):
@@ -130,12 +148,8 @@ def sanitize_textures_and_stubs(project_root: str, all_files: List[str]) -> Tupl
             try:
                 with open(p, "rb") as fh:
                     hdr = fh.read(16)
-                mismatch = False
-                if ext in ext_to_fmt and not hdr.startswith(ext_to_fmt[ext]):
-                    mismatch = True
-                elif ext == ".tga" and (hdr.startswith(b"\x89PNG") or hdr.startswith(b"\xff\xd8")):
-                    mismatch = True
-
+                mismatch = (ext in ext_to_fmt and not hdr.startswith(ext_to_fmt[ext])) or \
+                           (ext == ".tga" and (hdr.startswith(b"\x89PNG") or hdr.startswith(b"\xff\xd8")))
                 if mismatch:
                     with Image.open(p) as img:
                         save_image_safe(img, p)
@@ -163,7 +177,6 @@ def sanitize_textures_and_stubs(project_root: str, all_files: List[str]) -> Tupl
             except Exception:
                 pass
 
-    # 2. Required legacy texture aliases
     stubs = [
         "Assets/PolygonApocalypse/Textures/PolygonApocalypse_Texture_01_A 1.png",
         "Assets/PolygonApocalypse/Textures/Misc/PolygonApocalypse_Emissive_01.png",
@@ -201,21 +214,29 @@ def sanitize_textures_and_stubs(project_root: str, all_files: List[str]) -> Tupl
 # ==============================================================================
 # 3. FBX Material Slot Mapper
 # ==============================================================================
+def get_pack_root(file_path: str) -> str:
+    parts = file_path.replace("\\", "/").split("/")
+    for i, p in enumerate(parts):
+        if p.lower() == "synty" and i + 1 < len(parts):
+            return "/".join(parts[:i + 2])
+        if p.lower() == "assets" and i + 1 < len(parts):
+            if parts[i + 1].lower() == "synty" and i + 2 < len(parts):
+                return "/".join(parts[:i + 3])
+            return "/".join(parts[:i + 2])
+    return os.path.dirname(os.path.dirname(file_path))
+
+
 def extract_fbx_material_slots(fbx_path: str) -> Set[str]:
     slots = set()
     try:
         with open(fbx_path, "rb") as fh:
             data = fh.read(512 * 1024)
-        for m in re.findall(b"([a-zA-Z0-9_-]+)\x00\x01Material", data):
-            slots.add(m.decode("ascii", errors="ignore"))
-        for m in re.findall(b"Material::([a-zA-Z0-9_-]+)", data):
-            slots.add(m.decode("ascii", errors="ignore"))
-        for m in re.findall(b"Material[\x00-\x10]+([a-zA-Z0-9_ -]{2,40})[\x00-\x10]+(?:FbxSurfaceLambert|FbxSurfacePhong|Material)", data):
-            slots.add(m.decode("ascii", errors="ignore").strip())
-        for m in re.findall(b"([a-zA-Z0-9_ -]{2,40})\x00\x01(?:FbxSurfaceLambert|FbxSurfacePhong)", data):
-            slots.add(m.decode("ascii", errors="ignore").strip())
-        for m in re.findall(b"Material\x00+([a-zA-Z0-9_-]+)", data):
-            slots.add(m.decode("ascii", errors="ignore"))
+        for rx in (RE_FBX_MAT1, RE_FBX_MAT2, RE_FBX_MAT5):
+            for m in rx.findall(data):
+                slots.add(m.decode("ascii", errors="ignore"))
+        for rx in (RE_FBX_MAT3, RE_FBX_MAT4):
+            for m in rx.findall(data):
+                slots.add(m.decode("ascii", errors="ignore").strip())
     except Exception:
         pass
 
@@ -226,14 +247,14 @@ def extract_fbx_material_slots(fbx_path: str) -> Set[str]:
 def resolve_slot_material(slot: str, fbx_name: str, mats: Dict[str, str], default_atlas: str) -> str:
     s_low, f_low = slot.lower(), fbx_name.lower().replace(".fbx", "")
 
-    for predicate, candidates in SLOT_RULES:
-        if predicate(s_low, f_low):
+    for tag, candidates in SLOT_RULES:
+        if tag in s_low or tag in f_low:
             for cand in candidates:
                 if cand in mats:
                     return mats[cand]
 
     if any(k in s_low for k in ["wall", "a_wall", "brick", "stucco", "floor"]):
-        num_m = re.search(r"(\d+)", slot)
+        num_m = RE_NUM_EXT.search(slot)
         if num_m:
             target_key = f"wall_{num_m.group(1).zfill(2)}"
             for k in [f"{target_key}_a", f"{target_key}_b", target_key]:
@@ -259,10 +280,7 @@ def resolve_slot_material(slot: str, fbx_name: str, mats: Dict[str, str], defaul
 
 def clean_import_file(content: str) -> str:
     content = content.replace("valid=false\n", "").replace("valid=false", "")
-    content = re.sub(r"fbx/importer=\d+\n?", "", content)
-    content = re.sub(r"fbx/allow_geometry_helper_nodes=.*\n?", "", content)
-    content = re.sub(r"fbx/embedded_image_handling=.*\n?", "", content)
-    content = re.sub(r"fbx/naming_version=.*\n?", "", content)
+    content = RE_FBX_LINES.sub("", content)
 
     sub_idx = content.find("_subresources=")
     if sub_idx != -1:
@@ -288,13 +306,12 @@ def clean_import_file(content: str) -> str:
 
 
 def map_all_fbx_materials(project_root: str, all_files: List[str]) -> Tuple[int, int]:
-    # Index all materials per pack folder
     pack_materials: Dict[str, Dict[str, str]] = {}
     for p in all_files:
         if p.endswith((".mat.tres", ".tres")) and not p.endswith(".mesh"):
             stem = os.path.basename(p).replace(".mat.tres", "").replace(".tres", "").lower()
             rel = "res://" + os.path.relpath(p, project_root).replace("\\", "/")
-            pack_dir = os.path.dirname(os.path.dirname(p))
+            pack_dir = get_pack_root(p)
             pack_materials.setdefault(pack_dir, {})[stem] = rel
 
     total_models = total_slots = 0
@@ -304,7 +321,7 @@ def map_all_fbx_materials(project_root: str, all_files: List[str]) -> Tuple[int,
             if not os.path.exists(imp_path):
                 continue
 
-            pack_dir = os.path.dirname(os.path.dirname(p))
+            pack_dir = get_pack_root(p)
             mats = pack_materials.get(pack_dir, {})
             default_atlas = next((v for k, v in mats.items() if "01_a" in k or "colormap" in k), next(iter(mats.values()), ""))
 
@@ -336,7 +353,6 @@ def map_all_fbx_materials(project_root: str, all_files: List[str]) -> Tuple[int,
 def fix_character_rigs_and_visibility(all_files: List[str]) -> Tuple[int, int]:
     fixed_skels = fixed_prefabs = 0
 
-    # 1. Skeleton3D replacement
     for p in all_files:
         if p.endswith(".tscn"):
             try:
@@ -352,42 +368,38 @@ def fix_character_rigs_and_visibility(all_files: List[str]) -> Tuple[int, int]:
             except Exception:
                 pass
 
-    # 2. Multi-character prefab visibility
-    for p in all_files:
         if p.endswith(".prefab.tscn") and "/Characters/" in p.replace("\\", "/"):
             stem = os.path.basename(p).split(".")[0]
             try:
                 with open(p, "r", encoding="utf-8") as fh:
                     txt = fh.read()
                 char_nodes = re.findall(r'\[node name="([^"]+)"[^\]]*parent="Skeleton3D"[^\]]*\]', txt)
-                if len(char_nodes) <= 1:
-                    continue
+                if len(char_nodes) > 1:
+                    modified = False
+                    for cname in char_nodes:
+                        is_target = (cname == stem)
+                        m = re.search(rf'\[node name="{cname}"[^\]]*parent="Skeleton3D"[^\]]*\]', txt)
+                        if not m:
+                            continue
+                        n_start = m.start()
+                        next_n = txt.find("[node name=", m.end())
+                        sec = txt[n_start:next_n] if next_n != -1 else txt[n_start:]
 
-                modified = False
-                for cname in char_nodes:
-                    is_target = (cname == stem)
-                    m = re.search(rf'\[node name="{cname}"[^\]]*parent="Skeleton3D"[^\]]*\]', txt)
-                    if not m:
-                        continue
-                    n_start = m.start()
-                    next_n = txt.find("[node name=", m.end())
-                    sec = txt[n_start:next_n] if next_n != -1 else txt[n_start:]
+                        if "visible =" in sec:
+                            new_sec = re.sub(r"visible\s*=\s*(?:true|false)", f"visible = {str(is_target).lower()}", sec)
+                        else:
+                            lines = sec.splitlines()
+                            lines.insert(1, f"visible = {str(is_target).lower()}")
+                            new_sec = "\n".join(lines)
 
-                    if "visible =" in sec:
-                        new_sec = re.sub(r"visible\s*=\s*(?:true|false)", f"visible = {str(is_target).lower()}", sec)
-                    else:
-                        lines = sec.splitlines()
-                        lines.insert(1, f"visible = {str(is_target).lower()}")
-                        new_sec = "\n".join(lines)
+                        if new_sec != sec:
+                            txt = txt[:n_start] + new_sec + (txt[next_n:] if next_n != -1 else "")
+                            modified = True
 
-                    if new_sec != sec:
-                        txt = txt[:n_start] + new_sec + (txt[next_n:] if next_n != -1 else "")
-                        modified = True
-
-                if modified:
-                    with open(p, "w", encoding="utf-8") as fh:
-                        fh.write(txt)
-                    fixed_prefabs += 1
+                    if modified:
+                        with open(p, "w", encoding="utf-8") as fh:
+                            fh.write(txt)
+                        fixed_prefabs += 1
             except Exception:
                 pass
 
@@ -404,14 +416,14 @@ def synchronize_uids(project_root: str, all_files: List[str]) -> Tuple[int, int]
             if p.endswith(".import"):
                 with open(p, "r", encoding="utf-8", errors="ignore") as fh:
                     txt = fh.read()
-                uid_m = re.search(r'uid="([^"]+)"', txt)
-                src_m = re.search(r'source_file="([^"]+)"', txt)
+                uid_m = RE_EXT_UID.search(txt)
+                src_m = RE_SRC_FILE.search(txt)
                 if uid_m and src_m:
                     path_to_uid[src_m.group(1)] = uid_m.group(1)
             elif p.endswith(".tscn"):
                 with open(p, "r", encoding="utf-8", errors="ignore") as fh:
                     fline = fh.readline()
-                uid_m = re.search(r'uid="([^"]+)"', fline)
+                uid_m = RE_EXT_UID.search(fline)
                 if uid_m:
                     rel = "res://" + os.path.relpath(p, project_root).replace("\\", "/")
                     path_to_uid[rel] = uid_m.group(1)
@@ -434,8 +446,8 @@ def synchronize_uids(project_root: str, all_files: List[str]) -> Tuple[int, int]
 
             for line in lines:
                 if line.startswith("[ext_resource"):
-                    p_m = re.search(r'path="([^"]+)"', line)
-                    u_m = re.search(r'uid="([^"]+)"', line)
+                    p_m = RE_EXT_PATH.search(line)
+                    u_m = RE_EXT_UID.search(line)
                     if p_m and p_m.group(1) in path_to_uid:
                         target_uid = path_to_uid[p_m.group(1)]
                         if u_m:
@@ -487,7 +499,6 @@ def run_pipeline(project_root: str, package_path: str = None, purge_cache: bool 
         extracted = extract_unitypackage(package_path, project_root)
         print(f"      - Extracted {extracted} files into project.", flush=True)
 
-    # Unified single-pass filesystem scan
     all_files = collect_project_files(project_root)
 
     print("\n[1/4] Sanitizing Texture Files & Embedded Aliases...", flush=True)
