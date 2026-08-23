@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Godot Synty Importer & Automator (Streamlined Engine)
-===================================================
+Godot Synty Importer & Automator (High-Performance Parallel Engine)
+===================================================================
 Automates extraction, texture repair, Maya/Max material slot mapping,
 multi-character rig visibility, and UID synchronization for Synty asset packs in Godot 4.
 
@@ -14,10 +14,12 @@ import os
 import re
 import sys
 import tarfile
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Set, Tuple
 from PIL import Image
 
 IGNORED_DIRS = {".godot", ".git", "node_modules", ".import"}
+MAX_WORKERS = min(32, (os.cpu_count() or 4) * 4)
 
 FALLBACK_SLOTS = [
     "default", "Base_Lambert", "lambert", "lambert1", "standardSurface1",
@@ -33,7 +35,7 @@ SLOT_RULES = [
     ("target_hologram", ["hologram_targets_01", "hologram_targets", "hologram_01"]),
     ("holotarget", ["hologram_targets_01", "hologram_01"]),
     ("holo_sign", ["hologram_signs_01", "hologram_signs", "hologram_01"]),
-    ("holosign", ["hologram_signs_01", "hologram_01"]),
+    ("holosign", ["hologram_signs_01", "hologram_signs", "hologram_01"]),
     ("holo_poster", ["hologram_posters_01_a", "hologram_posters_01_b", "hologram_01"]),
     ("holo_text", ["hologram_text_01", "hologram_01"]),
     ("hologram_tree", ["hologram_01", "hologram_basic_01_a"]),
@@ -63,7 +65,6 @@ SLOT_RULES = [
     ("parallax", ["parallax_full_01", "parallax_01", "parallax"]),
 ]
 
-# Pre-compiled regular expressions for high throughput
 RE_FBX_MAT1 = re.compile(b"([a-zA-Z0-9_-]+)\x00\x01Material")
 RE_FBX_MAT2 = re.compile(b"Material::([a-zA-Z0-9_-]+)")
 RE_FBX_MAT3 = re.compile(b"Material[\x00-\x10]+([a-zA-Z0-9_ -]{2,40})[\x00-\x10]+(?:FbxSurfaceLambert|FbxSurfacePhong|Material)")
@@ -121,12 +122,13 @@ def save_image_safe(img: Image.Image, target_path: str) -> None:
     img.save(target_path, format="PNG" if ext == ".png" else ("TGA" if ext == ".tga" else "JPEG"))
 
 
-def sanitize_textures_and_stubs(project_root: str, all_files: List[str]) -> Tuple[int, int, int]:
+def sanitize_textures_and_stubs(project_root: str, categorized_files: Dict[str, List[str]]) -> Tuple[int, int, int]:
     fixed = aliases = norm = 0
     ext_to_fmt = {".png": b"\x89PNG\r\n\x1a\n", ".jpg": b"\xff\xd8\xff", ".jpeg": b"\xff\xd8\xff"}
 
+    # Find color atlases for cloning
     atlases = {}
-    for p in all_files:
+    for p in categorized_files.get("images", []):
         low = os.path.basename(p).lower()
         if "colormap" in low and "colormap_dst" not in low:
             atlases["colormap"] = p
@@ -137,14 +139,10 @@ def sanitize_textures_and_stubs(project_root: str, all_files: List[str]) -> Tupl
 
     default_atlas = atlases.get("cyber") or atlases.get("generic") or next(iter(atlases.values()), None)
 
-    for p in all_files:
+    # 1. Format check & repair
+    def check_image(p):
         ext = os.path.splitext(p)[1].lower()
-        if ext == ".psd" or p.endswith(".psd.import"):
-            try:
-                os.remove(p)
-            except Exception:
-                pass
-        elif ext in ext_to_fmt or ext == ".tga":
+        if ext in ext_to_fmt or ext == ".tga":
             try:
                 with open(p, "rb") as fh:
                     hdr = fh.read(16)
@@ -153,30 +151,44 @@ def sanitize_textures_and_stubs(project_root: str, all_files: List[str]) -> Tupl
                 if mismatch:
                     with Image.open(p) as img:
                         save_image_safe(img, p)
-                        fixed += 1
+                        return 1
             except Exception:
                 pass
-        elif p.endswith((".png.import", ".tga.import", ".jpg.import", ".webp.import")) and "normal" not in p.lower():
-            try:
-                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
-                    txt = fh.read()
-                mod = False
-                if "valid=false" in txt:
-                    txt = txt.replace("valid=false\n", "").replace("valid=false", "")
-                    mod = True
-                if "compress/normal_map=2" in txt or "compress/normal_map=1" in txt:
-                    txt = re.sub(r"compress/normal_map=\d+", "compress/normal_map=0", txt)
-                    mod = True
-                if "roughness/mode=1" in txt or "roughness/mode=2" in txt:
-                    txt = re.sub(r"roughness/mode=\d+", "roughness/mode=0", txt)
-                    mod = True
-                if mod:
-                    with open(p, "w", encoding="utf-8") as fh:
-                        fh.write(txt)
-                    norm += 1
-            except Exception:
-                pass
+        return 0
 
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        fixed = sum(ex.map(check_image, categorized_files.get("images", [])))
+
+    # 2. Texture .import normalizer
+    def check_texture_import(p):
+        if "normal" in p.lower():
+            return 0
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                txt = fh.read()
+            mod = False
+            if "valid=false" in txt:
+                txt = txt.replace("valid=false\n", "").replace("valid=false", "")
+                mod = True
+            if "compress/normal_map=2" in txt or "compress/normal_map=1" in txt:
+                txt = re.sub(r"compress/normal_map=\d+", "compress/normal_map=0", txt)
+                mod = True
+            if "roughness/mode=1" in txt or "roughness/mode=2" in txt:
+                txt = re.sub(r"roughness/mode=\d+", "roughness/mode=0", txt)
+                mod = True
+            if mod:
+                with open(p, "w", encoding="utf-8") as fh:
+                    fh.write(txt)
+                return 1
+        except Exception:
+            pass
+        return 0
+
+    tex_imports = [p for p in categorized_files.get("imports", []) if any(p.endswith(ext + ".import") for ext in [".png", ".tga", ".jpg", ".webp"])]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        norm = sum(ex.map(check_texture_import, tex_imports))
+
+    # 3. Required legacy texture aliases
     stubs = [
         "Assets/PolygonApocalypse/Textures/PolygonApocalypse_Texture_01_A 1.png",
         "Assets/PolygonApocalypse/Textures/Misc/PolygonApocalypse_Emissive_01.png",
@@ -305,103 +317,114 @@ def clean_import_file(content: str) -> str:
     return content.strip()
 
 
-def map_all_fbx_materials(project_root: str, all_files: List[str]) -> Tuple[int, int]:
+def map_all_fbx_materials(project_root: str, categorized_files: Dict[str, List[str]]) -> Tuple[int, int]:
     pack_materials: Dict[str, Dict[str, str]] = {}
-    for p in all_files:
-        if p.endswith((".mat.tres", ".tres")) and not p.endswith(".mesh"):
-            stem = os.path.basename(p).replace(".mat.tres", "").replace(".tres", "").lower()
-            rel = "res://" + os.path.relpath(p, project_root).replace("\\", "/")
-            pack_dir = get_pack_root(p)
-            pack_materials.setdefault(pack_dir, {})[stem] = rel
+    for p in categorized_files.get("materials", []):
+        stem = os.path.basename(p).replace(".mat.tres", "").replace(".tres", "").lower()
+        rel = "res://" + os.path.relpath(p, project_root).replace("\\", "/")
+        pack_dir = get_pack_root(p)
+        pack_materials.setdefault(pack_dir, {})[stem] = rel
 
-    total_models = total_slots = 0
-    for p in all_files:
-        if p.endswith(".fbx"):
-            imp_path = p + ".import"
-            if not os.path.exists(imp_path):
-                continue
+    def process_fbx(p):
+        imp_path = p + ".import"
+        if not os.path.exists(imp_path):
+            return 0, 0
 
-            pack_dir = get_pack_root(p)
-            mats = pack_materials.get(pack_dir, {})
-            default_atlas = next((v for k, v in mats.items() if "01_a" in k or "colormap" in k), next(iter(mats.values()), ""))
+        pack_dir = get_pack_root(p)
+        mats = pack_materials.get(pack_dir, {})
+        default_atlas = next((v for k, v in mats.items() if "01_a" in k or "colormap" in k), next(iter(mats.values()), ""))
 
-            slots = extract_fbx_material_slots(p)
-            fbx_name = os.path.basename(p)
-            mat_lines = [
-                f'"{s}": {{\n"use_external/enabled": true,\n"use_external/path": "{resolve_slot_material(s, fbx_name, mats, default_atlas)}"\n}}'
-                for s in sorted(slots)
-            ]
-            total_slots += len(mat_lines)
+        slots = extract_fbx_material_slots(p)
+        fbx_name = os.path.basename(p)
+        mat_lines = [
+            f'"{s}": {{\n"use_external/enabled": true,\n"use_external/path": "{resolve_slot_material(s, fbx_name, mats, default_atlas)}"\n}}'
+            for s in sorted(slots)
+        ]
 
-            try:
-                with open(imp_path, "r", encoding="utf-8", errors="ignore") as fh:
-                    raw = fh.read()
-                sub_body = ",\n".join(mat_lines)
-                final_txt = clean_import_file(raw) + f'\n\n_subresources={{\n"materials": {{\n{sub_body}\n}}\n}}\n'
+        try:
+            with open(imp_path, "r", encoding="utf-8", errors="ignore") as fh:
+                raw = fh.read()
+            sub_body = ",\n".join(mat_lines)
+            final_txt = clean_import_file(raw) + f'\n\n_subresources={{\n"materials": {{\n{sub_body}\n}}\n}}\n'
+            if final_txt != raw:
                 with open(imp_path, "w", encoding="utf-8") as fh:
                     fh.write(final_txt)
-                total_models += 1
-            except Exception:
-                pass
+            return 1, len(mat_lines)
+        except Exception:
+            return 0, 0
 
+    fbx_list = categorized_files.get("fbx", [])
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        results = list(ex.map(process_fbx, fbx_list))
+
+    total_models = sum(r[0] for r in results)
+    total_slots = sum(r[1] for r in results)
     return total_models, total_slots
 
 
 # ==============================================================================
 # 4. Character Rig Migration & Visibility Configuration
 # ==============================================================================
-def fix_character_rigs_and_visibility(all_files: List[str]) -> Tuple[int, int]:
-    fixed_skels = fixed_prefabs = 0
+def fix_character_rigs_and_visibility(categorized_files: Dict[str, List[str]]) -> Tuple[int, int]:
+    def process_tscn(p):
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                txt = fh.read()
+            if "GeneralSkeleton" in txt:
+                txt = txt.replace('parent="GeneralSkeleton"', 'parent="Skeleton3D"')
+                txt = txt.replace('"GeneralSkeleton"', '"Skeleton3D"')
+                txt = txt.replace("GeneralSkeleton/", "Skeleton3D/")
+                with open(p, "w", encoding="utf-8") as fh:
+                    fh.write(txt)
+                return 1
+        except Exception:
+            pass
+        return 0
 
-    for p in all_files:
-        if p.endswith(".tscn"):
-            try:
-                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
-                    txt = fh.read()
-                if "GeneralSkeleton" in txt:
-                    txt = txt.replace('parent="GeneralSkeleton"', 'parent="Skeleton3D"')
-                    txt = txt.replace('"GeneralSkeleton"', '"Skeleton3D"')
-                    txt = txt.replace("GeneralSkeleton/", "Skeleton3D/")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        fixed_skels = sum(ex.map(process_tscn, categorized_files.get("tscn", [])))
+
+    def process_prefab(p):
+        if "/Characters/" not in p.replace("\\", "/"):
+            return 0
+        stem = os.path.basename(p).split(".")[0]
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                txt = fh.read()
+            char_nodes = re.findall(r'\[node name="([^"]+)"[^\]]*parent="Skeleton3D"[^\]]*\]', txt)
+            if len(char_nodes) > 1:
+                modified = False
+                for cname in char_nodes:
+                    is_target = (cname == stem)
+                    m = re.search(rf'\[node name="{cname}"[^\]]*parent="Skeleton3D"[^\]]*\]', txt)
+                    if not m:
+                        continue
+                    n_start = m.start()
+                    next_n = txt.find("[node name=", m.end())
+                    sec = txt[n_start:next_n] if next_n != -1 else txt[n_start:]
+
+                    if "visible =" in sec:
+                        new_sec = re.sub(r"visible\s*=\s*(?:true|false)", f"visible = {str(is_target).lower()}", sec)
+                    else:
+                        lines = sec.splitlines()
+                        lines.insert(1, f"visible = {str(is_target).lower()}")
+                        new_sec = "\n".join(lines)
+
+                    if new_sec != sec:
+                        txt = txt[:n_start] + new_sec + (txt[next_n:] if next_n != -1 else "")
+                        modified = True
+
+                if modified:
                     with open(p, "w", encoding="utf-8") as fh:
                         fh.write(txt)
-                    fixed_skels += 1
-            except Exception:
-                pass
+                    return 1
+        except Exception:
+            pass
+        return 0
 
-        if p.endswith(".prefab.tscn") and "/Characters/" in p.replace("\\", "/"):
-            stem = os.path.basename(p).split(".")[0]
-            try:
-                with open(p, "r", encoding="utf-8") as fh:
-                    txt = fh.read()
-                char_nodes = re.findall(r'\[node name="([^"]+)"[^\]]*parent="Skeleton3D"[^\]]*\]', txt)
-                if len(char_nodes) > 1:
-                    modified = False
-                    for cname in char_nodes:
-                        is_target = (cname == stem)
-                        m = re.search(rf'\[node name="{cname}"[^\]]*parent="Skeleton3D"[^\]]*\]', txt)
-                        if not m:
-                            continue
-                        n_start = m.start()
-                        next_n = txt.find("[node name=", m.end())
-                        sec = txt[n_start:next_n] if next_n != -1 else txt[n_start:]
-
-                        if "visible =" in sec:
-                            new_sec = re.sub(r"visible\s*=\s*(?:true|false)", f"visible = {str(is_target).lower()}", sec)
-                        else:
-                            lines = sec.splitlines()
-                            lines.insert(1, f"visible = {str(is_target).lower()}")
-                            new_sec = "\n".join(lines)
-
-                        if new_sec != sec:
-                            txt = txt[:n_start] + new_sec + (txt[next_n:] if next_n != -1 else "")
-                            modified = True
-
-                    if modified:
-                        with open(p, "w", encoding="utf-8") as fh:
-                            fh.write(txt)
-                        fixed_prefabs += 1
-            except Exception:
-                pass
+    prefabs = [p for p in categorized_files.get("tscn", []) if p.endswith(".prefab.tscn")]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        fixed_prefabs = sum(ex.map(process_prefab, prefabs))
 
     return fixed_skels, fixed_prefabs
 
@@ -409,9 +432,10 @@ def fix_character_rigs_and_visibility(all_files: List[str]) -> Tuple[int, int]:
 # ==============================================================================
 # 5. Scene & Resource UID Synchronizer
 # ==============================================================================
-def synchronize_uids(project_root: str, all_files: List[str]) -> Tuple[int, int]:
+def synchronize_uids(project_root: str, categorized_files: Dict[str, List[str]]) -> Tuple[int, int]:
     path_to_uid = {}
-    for p in all_files:
+
+    def extract_uid(p):
         try:
             if p.endswith(".import"):
                 with open(p, "r", encoding="utf-8", errors="ignore") as fh:
@@ -419,29 +443,34 @@ def synchronize_uids(project_root: str, all_files: List[str]) -> Tuple[int, int]
                 uid_m = RE_EXT_UID.search(txt)
                 src_m = RE_SRC_FILE.search(txt)
                 if uid_m and src_m:
-                    path_to_uid[src_m.group(1)] = uid_m.group(1)
+                    return src_m.group(1), uid_m.group(1)
             elif p.endswith(".tscn"):
                 with open(p, "r", encoding="utf-8", errors="ignore") as fh:
                     fline = fh.readline()
                 uid_m = RE_EXT_UID.search(fline)
                 if uid_m:
                     rel = "res://" + os.path.relpath(p, project_root).replace("\\", "/")
-                    path_to_uid[rel] = uid_m.group(1)
+                    return rel, uid_m.group(1)
         except Exception:
             pass
+        return None
 
-    updated_scenes = uids_fixed = 0
-    for p in all_files:
-        if not p.endswith(".tscn"):
-            continue
+    scan_targets = categorized_files.get("imports", []) + categorized_files.get("tscn", [])
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        for res in ex.map(extract_uid, scan_targets):
+            if res:
+                path_to_uid[res[0]] = res[1]
+
+    def sync_scene(p):
         try:
             with open(p, "r", encoding="utf-8", errors="ignore") as fh:
                 txt = fh.read()
             if "[ext_resource" not in txt:
-                continue
+                return 0, 0
 
             lines = txt.splitlines()
             modified = False
+            u_fixed = 0
             new_lines = []
 
             for line in lines:
@@ -454,33 +483,58 @@ def synchronize_uids(project_root: str, all_files: List[str]) -> Tuple[int, int]
                             if u_m.group(1) != target_uid:
                                 line = line.replace(u_m.group(1), target_uid)
                                 modified = True
-                                uids_fixed += 1
+                                u_fixed += 1
                         else:
                             line = line.replace("[ext_resource ", f'[ext_resource uid="{target_uid}" ')
                             modified = True
-                            uids_fixed += 1
+                            u_fixed += 1
                 new_lines.append(line)
 
             if modified:
                 with open(p, "w", encoding="utf-8") as fh:
                     fh.write("\n".join(new_lines) + "\n")
-                updated_scenes += 1
+                return 1, u_fixed
         except Exception:
             pass
+        return 0, 0
 
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        results = list(ex.map(sync_scene, categorized_files.get("tscn", [])))
+
+    updated_scenes = sum(r[0] for r in results)
+    uids_fixed = sum(r[1] for r in results)
     return updated_scenes, uids_fixed
 
 
 # ==============================================================================
 # Pipeline Coordinator
 # ==============================================================================
-def collect_project_files(project_root: str) -> List[str]:
-    files_list = []
+def collect_project_files(project_root: str) -> Dict[str, List[str]]:
+    categorized = {
+        "fbx": [],
+        "tscn": [],
+        "imports": [],
+        "images": [],
+        "materials": [],
+    }
+    image_exts = {".png", ".tga", ".jpg", ".jpeg", ".webp"}
+
     for root, dirs, files in os.walk(project_root):
         dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
         for f in files:
-            files_list.append(os.path.join(root, f))
-    return files_list
+            full_path = os.path.join(root, f)
+            if f.endswith(".fbx"):
+                categorized["fbx"].append(full_path)
+            elif f.endswith(".tscn"):
+                categorized["tscn"].append(full_path)
+            elif f.endswith(".import"):
+                categorized["imports"].append(full_path)
+            elif f.endswith((".mat.tres", ".tres")) and not f.endswith(".mesh"):
+                categorized["materials"].append(full_path)
+            elif os.path.splitext(f)[1].lower() in image_exts:
+                categorized["images"].append(full_path)
+
+    return categorized
 
 
 def run_pipeline(project_root: str, package_path: str = None, purge_cache: bool = False) -> None:
@@ -499,25 +553,26 @@ def run_pipeline(project_root: str, package_path: str = None, purge_cache: bool 
         extracted = extract_unitypackage(package_path, project_root)
         print(f"      - Extracted {extracted} files into project.", flush=True)
 
-    all_files = collect_project_files(project_root)
+    # Fast single-pass filesystem scan
+    categorized_files = collect_project_files(project_root)
 
     print("\n[1/4] Sanitizing Texture Files & Embedded Aliases...", flush=True)
-    fixed_tex, aliases, norm_tex = sanitize_textures_and_stubs(project_root, all_files)
+    fixed_tex, aliases, norm_tex = sanitize_textures_and_stubs(project_root, categorized_files)
     print(f"      - Fixed misnamed image formats: {fixed_tex}", flush=True)
     print(f"      - Created embedded texture aliases: {aliases}", flush=True)
     print(f"      - Normalized sRGB import settings: {norm_tex}", flush=True)
 
     print("\n[2/4] Scanning & Mapping FBX Internal Material Slots...", flush=True)
-    models, slots = map_all_fbx_materials(project_root, all_files)
+    models, slots = map_all_fbx_materials(project_root, categorized_files)
     print(f"      - Mapped {slots} material slots across {models} FBX models.", flush=True)
 
     print("\n[3/4] Rectifying Character Rigs & Mesh Visibility...", flush=True)
-    fixed_skels, fixed_chars = fix_character_rigs_and_visibility(all_files)
+    fixed_skels, fixed_chars = fix_character_rigs_and_visibility(categorized_files)
     print(f"      - Updated GeneralSkeleton -> Skeleton3D in {fixed_skels} scenes/prefabs.", flush=True)
     print(f"      - Applied selective mesh visibility to {fixed_chars} character prefabs.", flush=True)
 
     print("\n[4/4] Synchronizing Scene & Resource UIDs...", flush=True)
-    synced_scenes, fixed_uids = synchronize_uids(project_root, all_files)
+    synced_scenes, fixed_uids = synchronize_uids(project_root, categorized_files)
     print(f"      - Synchronized {fixed_uids} resource UIDs across {synced_scenes} scene files.", flush=True)
 
     if purge_cache:
