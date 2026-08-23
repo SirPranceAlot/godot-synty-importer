@@ -68,18 +68,13 @@ When importing Synty asset packs into Godot 4, several recurring engine incompat
 
 ```text
 godot-synty-importer/
-├── synty_automator.py               # Main CLI automation pipeline
-├── modules/
-│   ├── unitypackage_extractor.py    # Direct .unitypackage tar.gz unpacker
-│   ├── texture_sanitizer.py         # Image format verification & stub generator
-│   ├── fbx_slot_mapper.py           # FBX binary slot parser & .import writer
-│   ├── character_prefab_fixer.py    # Skeleton3D migration & visibility setup
-│   └── uid_synchronizer.py          # Scene & resource UID synchronizer
-└── addons/synty_importer/           # Standalone Godot 4 Editor Plugin
+├── synty_automator.py               # Single-file standalone CLI tool
+├── requirements.txt
+├── README.md
+└── addons/synty_importer/           # Standalone Godot 4 Editor Addon
     ├── plugin.cfg
     ├── plugin.gd
-    ├── synty_automator.py
-    └── modules/
+    └── synty_automator.py           # Self-contained automation engine
 ```
 
 ---
