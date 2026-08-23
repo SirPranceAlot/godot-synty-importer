@@ -35,6 +35,13 @@ except ImportError:
 IGNORED_DIRS = {".godot", ".git", "node_modules", ".import"}
 MAX_WORKERS = min(32, (os.cpu_count() or 4) * 4)
 
+# Pre-allocated 1x1 transparent PNG fallback bytes
+PNG_1X1_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00"
+    b"\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
 # Universal fallback material slots found across Maya/3ds Max Synty exports
 FALLBACK_SLOTS = [
     "default", "Base_Lambert", "lambert", "lambert1", "standardSurface1",
@@ -187,10 +194,8 @@ def save_image_safe(img, target_path: str) -> None:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     if not HAS_PIL or img is None:
         try:
-            # Fallback: create 1x1 neutral transparent PNG bytes if Pillow is missing
-            png_1x1 = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82"
             with open(target_path, "wb") as fh:
-                fh.write(png_1x1)
+                fh.write(PNG_1X1_BYTES)
         except Exception:
             pass
         return
@@ -515,17 +520,12 @@ def map_all_fbx_materials(project_root: str, categorized_files: Dict[str, List[s
             for s in sorted(slots)
         ]
 
-        try:
-            with open(imp_path, "r", encoding="utf-8", errors="ignore") as fh:
-                raw = fh.read()
-            sub_body = ",\n".join(mat_lines)
-            final_txt = clean_import_file(raw) + f'\n\n_subresources={{\n"materials": {{\n{sub_body}\n}}\n}}\n'
-            if final_txt != raw:
-                with open(imp_path, "w", encoding="utf-8") as fh:
-                    fh.write(final_txt)
-            return 1, len(mat_lines)
-        except Exception:
-            return 0, 0
+        sub_body = ",\n".join(mat_lines)
+        def _modify(raw: str) -> str:
+            return clean_import_file(raw) + f'\n\n_subresources={{\n"materials": {{\n{sub_body}\n}}\n}}\n'
+
+        transform_file(imp_path, _modify)
+        return 1, len(mat_lines)
 
     fbx_list = categorized_files.get("fbx", [])
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -625,17 +625,13 @@ def synchronize_uids(project_root: str, categorized_files: Dict[str, List[str]])
                 path_to_uid[res[0]] = res[1]
 
     def sync_scene(p: str) -> Tuple[int, int]:
-        try:
-            with open(p, "r", encoding="utf-8", errors="ignore") as fh:
-                txt = fh.read()
+        u_fixed = [0]
+        def _modify(txt: str) -> Optional[str]:
             if "[ext_resource" not in txt:
-                return 0, 0
-
+                return None
             lines = txt.splitlines()
             modified = False
-            u_fixed = 0
             new_lines = []
-
             for line in lines:
                 if line.startswith("[ext_resource"):
                     p_m = RE_EXT_PATH.search(line)
@@ -646,20 +642,16 @@ def synchronize_uids(project_root: str, categorized_files: Dict[str, List[str]])
                             if u_m.group(1) != target_uid:
                                 line = line.replace(u_m.group(1), target_uid)
                                 modified = True
-                                u_fixed += 1
+                                u_fixed[0] += 1
                         else:
                             line = line.replace("[ext_resource ", f'[ext_resource uid="{target_uid}" ')
                             modified = True
-                            u_fixed += 1
+                            u_fixed[0] += 1
                 new_lines.append(line)
+            return "\n".join(new_lines) + "\n" if modified else None
 
-            if modified:
-                with open(p, "w", encoding="utf-8") as fh:
-                    fh.write("\n".join(new_lines) + "\n")
-                return 1, u_fixed
-        except Exception:
-            pass
-        return 0, 0
+        modified = transform_file(p, _modify)
+        return (1 if modified else 0), u_fixed[0]
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         results = list(ex.map(sync_scene, categorized_files.get("tscn", [])))
