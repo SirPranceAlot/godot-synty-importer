@@ -49,7 +49,7 @@ If you already extracted or moved Synty assets in your project:
 - **Universal Synty Pack Compatibility**: Fully dynamic heuristics support any Synty Studios pack (Polygon, Simple, Sidekick, Fantasy, Sci-Fi, Dungeon, City, Apocalypse, Western, Samurai, Nature, etc.).
 - **Dynamic Missing Texture & PSD Resolver**: Dynamically scans all scenes, materials, and FBX binaries, auto-generating neutral and atlas texture stubs so missing embedded paths never crash or trigger 404 image errors.
 - **Automated StandardMaterial3D Generation**: Automatically generates Godot 4 `StandardMaterial3D` resources for any asset pack that only includes raw FBX meshes and textures.
-- **Deep FBX Material Slot Mapping**: Resolves internal Maya/3ds Max material slots (e.g., `MAT_01A`, `Scifi_1a9`, `lambert`) to Godot `.mat.tres` materials using a 4-tier semantic fallback system.
+- **Deep FBX Material Slot Mapping**: Resolves internal Maya/3ds Max material slots (e.g., `MAT_01A`, `Scifi_1a9`, `lambert`) to Godot `.mat.tres` materials using a 7-tier semantic fallback system.
 - **Selective Multi-Character Visibility**: Configures multi-mesh character prefabs (e.g. `Characters.fbx`) so only the matching character variant is visible.
 - **Texture Format Normalization**: Detects and fixes misnamed image formats and corrects sRGB / normal map compression flags in `.import` files.
 - **Triplanar Material Configuration**: Configures world-triplanar UV projection and scaling on modular building materials.

@@ -9,7 +9,7 @@ Handles:
   - Raw .unitypackage extraction
   - Dynamic missing texture & PSD alias resolution
   - Automated StandardMaterial3D generation for packs lacking Godot materials
-  - Deep FBX binary material slot parsing & 4-tier semantic material mapping
+  - Deep FBX binary material slot parsing & 7-tier semantic material mapping
   - Universal multi-character rig hierarchy & selective mesh visibility
   - Project-wide scene & resource UID synchronization
   - World-triplanar UV & normal map import normalization
@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import mmap
 import os
 import re
 import sys
@@ -35,11 +36,17 @@ except ImportError:
 IGNORED_DIRS = {".godot", ".git", "node_modules", ".import"}
 MAX_WORKERS = min(32, (os.cpu_count() or 4) * 4)
 
-# Pre-allocated 1x1 transparent PNG fallback bytes
+# Pre-allocated valid 1x1 transparent RGBA PNG fallback bytes (70 bytes)
 PNG_1X1_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-    b"\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00"
-    b"\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc````"
+    b"\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+# Pre-allocated valid 1x1 transparent RGBA uncompressed TGA fallback bytes (48 bytes)
+TGA_1X1_BYTES = (
+    b"\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01\x00\x20\x08"
+    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00TRUEVISION-XFILE.\x00"
 )
 
 # Unified Semantic Category-to-Keyword mappings for dynamic material discovery
@@ -71,14 +78,26 @@ RE_FBX_MAT2 = re.compile(b"Material::([a-zA-Z0-9_-]+)")
 RE_FBX_MAT3 = re.compile(b"Material[\x00-\x10]+([a-zA-Z0-9_ -]{2,40})[\x00-\x10]+(?:FbxSurfaceLambert|FbxSurfacePhong|Material)")
 RE_FBX_MAT4 = re.compile(b"([a-zA-Z0-9_ -]{2,40})\x00\x01(?:FbxSurfaceLambert|FbxSurfacePhong)")
 RE_FBX_MAT5 = re.compile(b"Material\x00+([a-zA-Z0-9_-]+)")
+RE_FBX_EMBEDDED_TEX = re.compile(b'([a-zA-Z0-9_/\\\\.: -]{3,100}\\.(?:psd|psb|tif|tiff|png|tga|jpg|jpeg))', re.IGNORECASE)
 RE_FBX_LINES = re.compile(r"fbx/(?:importer|allow_geometry_helper_nodes|embedded_image_handling|naming_version)=.*\n?")
 RE_EXT_PATH = re.compile(r'path="([^"]+)"')
 RE_EXT_UID = re.compile(r'uid="([^"]+)"')
 RE_SRC_FILE = re.compile(r'source_file="([^"]+)"')
 RE_NUM_EXT = re.compile(r"(\d+)")
 RE_RES_TEX = re.compile(r'path="res://([^"]+\.(?:png|psd|tga|jpg|jpeg|webp))"', re.IGNORECASE)
-RE_CLEAN_PREFIX = re.compile(r"^(?:mat_|m_|shd_|lambert_|standardsurface_|pasted__|roboguy_)+", re.IGNORECASE)
+RE_CLEAN_PREFIX = re.compile(r"^(?:mat_|m_|shd_|lambert_|standardsurface_|pasted__)+", re.IGNORECASE)
 RE_CLEAN_SUFFIX = re.compile(r"(?:_sg\d+|sg\d+|\.mat|\.tres)+$", re.IGNORECASE)
+
+
+# ==============================================================================
+# Helper: Error Reporting
+# ==============================================================================
+_ERRORS = 0
+
+def fail_warn(message: str) -> None:
+    global _ERRORS
+    _ERRORS += 1
+    print(f"      [WARN] {message}", file=sys.stderr, flush=True)
 
 
 # ==============================================================================
@@ -93,8 +112,8 @@ def transform_file(file_path: str, transform_fn: Callable[[str], Optional[str]])
             with open(file_path, "w", encoding="utf-8") as fh:
                 fh.write(res)
             return True
-    except Exception:
-        pass
+    except Exception as exc:
+        fail_warn(f"Failed to transform {file_path}: {exc}")
     return False
 
 
@@ -136,15 +155,51 @@ def extract_unitypackage(package_path: str, destination_root: str) -> int:
                     if not rel:
                         continue
                     target = os.path.join(destination_root, rel)
+                    if not os.path.realpath(target).startswith(os.path.realpath(destination_root) + os.sep):
+                        fail_warn(f"Skipped unsafe path in package: {rel}")
+                        continue
                     os.makedirs(os.path.dirname(target), exist_ok=True)
                     af = tar.extractfile(items["asset"])
                     if af:
                         with open(target, "wb") as out:
                             out.write(af.read())
                         extracted += 1
-                except Exception:
-                    pass
+                except Exception as exc:
+                    fail_warn(f"Failed to extract package entry {guid}: {exc}")
     return extracted
+
+
+# ==============================================================================
+# Helper: FBX Embedded Texture Reference Scanner
+# ==============================================================================
+def find_missing_fbx_textures(fbx_path: str, project_root: str) -> Set[str]:
+    missing = set()
+    try:
+        fbx_dir = os.path.dirname(fbx_path)
+        with open(fbx_path, "rb") as fh:
+            with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                for m in RE_FBX_EMBEDDED_TEX.findall(data):
+                    s = m.decode("utf-8", errors="ignore").replace("\\", "/").strip()
+                    filename = os.path.basename(s)
+                    sibling = os.path.normpath(os.path.join(fbx_dir, filename))
+                    if not os.path.exists(sibling):
+                        missing.add(sibling)
+                    if ":" not in s and not s.startswith("/"):
+                        rel_target = os.path.normpath(os.path.join(fbx_dir, s))
+                        if not os.path.exists(rel_target):
+                            missing.add(rel_target)
+                    else:
+                        # Strip drive letter and leading slashes for absolute paths
+                        clean_s = re.sub(r"^[a-zA-Z]:[/\\]+", "", s).lstrip("/")
+                        p_target = os.path.normpath(os.path.join(project_root, clean_s))
+                        if not os.path.exists(p_target):
+                            missing.add(p_target)
+                        assets_target = os.path.normpath(os.path.join(project_root, "Assets", clean_s))
+                        if not os.path.exists(assets_target):
+                            missing.add(assets_target)
+    except Exception as exc:
+        fail_warn(f"Failed to scan {fbx_path}: {exc}")
+    return missing
 
 
 # ==============================================================================
@@ -152,15 +207,18 @@ def extract_unitypackage(package_path: str, destination_root: str) -> int:
 # ==============================================================================
 def save_image_safe(img, target_path: str) -> None:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    ext = os.path.splitext(target_path)[1].lower()
     if not HAS_PIL or img is None:
         try:
             with open(target_path, "wb") as fh:
-                fh.write(PNG_1X1_BYTES)
+                if ext == ".tga":
+                    fh.write(TGA_1X1_BYTES)
+                else:
+                    fh.write(PNG_1X1_BYTES)
         except Exception:
             pass
         return
 
-    ext = os.path.splitext(target_path)[1].lower()
     fmt = "PNG" if ext == ".png" else ("TGA" if ext == ".tga" else "JPEG")
     try:
         img.save(target_path, format=fmt)
@@ -208,7 +266,7 @@ def sanitize_and_resolve_textures(project_root: str, categorized_files: Dict[str
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         fixed_formats = sum(ex.map(check_image, categorized_files.get("images", [])))
 
-    # 2. Dynamic Missing Texture Discovery across all .tres, .mat.tres, .tscn
+    # 2. Dynamic Missing Texture Discovery across all .tres, .mat.tres, .tscn, and .fbx
     referenced_textures: Set[str] = set()
 
     def scan_tex_refs(p: str) -> None:
@@ -221,29 +279,14 @@ def sanitize_and_resolve_textures(project_root: str, categorized_files: Dict[str
             pass
 
     scan_targets = categorized_files.get("materials", []) + categorized_files.get("tscn", [])
+    scan_fbx = categorized_files.get("fbx", [])
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         list(ex.map(scan_tex_refs, scan_targets))
-
-    # Also add common Synty legacy workstation paths
-    legacy_stubs = [
-        "Assets/PolygonApocalypse/Textures/PolygonApocalypse_Texture_01_A 1.png",
-        "Assets/PolygonApocalypse/Textures/Misc/PolygonApocalypse_Emissive_01.png",
-        "Assets/PolygonApocalypse/Textures/Misc/PolygonApocalypse_Normal.png",
-        "Assets/AnimationBaseLocomotion/Samples/Meshes/SimpleSky.png",
-        "Assets/Synty/_SidekickCharacters/_published/_textures/Base_ColorLabels_01.png",
-        "Assets/Synty/_SidekickCharacters/_Textures/_Working/Base_Color_01.png",
-        "Assets/Synty/_Working/Jordan/_textures/sci_fi_sold_01.png",
-        "Assets/Synty/SidekickCharacters/Resources/Meshes/Outfits/ScifiSoldiers/Sci-fiSoldier_Color_01_Label.png",
-        "Assets/Synty/SidekickCharacters/Resources/Meshes/Outfits/ScifiSoldiers/sci_fi_sold_01.png",
-        "Assets/Synty/Dropbox/SyntyStudios_CharacterDesigner/_Working/Jordan/_textures/sci_fi_sold_01.png",
-        "Dropbox/SyntyStudios_CharacterDesigner/_Working/Jordan/_textures/sci_fi_sold_01.png",
-        "Assets/Synty/Dropbox/SyntyStudios_CharacterDesigner/_SidekickCharacters/_published/_textures/Base_ColorLabels_01.png",
-        "Dropbox/SyntyStudios_CharacterDesigner/_SidekickCharacters/_published/_textures/Base_ColorLabels_01.png",
-        "Assets/Synty/Dropbox/SyntyStudios_CharacterDesigner/_SidekickCharacters/_Textures/_Working/Base_Color_01.png",
-        "Dropbox/SyntyStudios_CharacterDesigner/_SidekickCharacters/_Textures/_Working/Base_Color_01.png",
-    ]
-    for ls in legacy_stubs:
-        referenced_textures.add(ls)
+        for missing in ex.map(lambda p: find_missing_fbx_textures(p, project_root), scan_fbx):
+            for t in missing:
+                rel = os.path.relpath(t, project_root).replace("\\", "/")
+                if not rel.startswith(".."):
+                    referenced_textures.add(rel)
 
     # Dynamic Provisioning of Missing Textures
     for rel in referenced_textures:
@@ -294,11 +337,35 @@ def sanitize_and_resolve_textures(project_root: str, categorized_files: Dict[str
 
 
 # ==============================================================================
+# Helper: String Tokenizer & Numeric ID Extractor
+# ==============================================================================
+PREFIX_STRIP = (
+    "sm_", "sk_", "t_", "m_", "mat_", "gen_", "bld_", "prop_", "env_",
+    "chr_", "wep_", "veh_", "fx_", "polygon_", "polygon", "generic_"
+)
+
+def extract_numeric_id(s: str) -> str:
+    parts = s.lower().split("_")
+    for p in parts:
+        if p.isdigit() and len(p) >= 2:
+            return p
+    digits = re.findall(r"\d{2,}", s)
+    return digits[0] if digits else ""
+
+def tokenize_string(s: str) -> List[str]:
+    clean = s.lower()
+    for prefix in PREFIX_STRIP:
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):]
+            break
+    clean = re.sub(r"[_.\-\s]+", " ", clean)
+    return [t.strip() for t in clean.split(" ") if t.strip()]
+
+# ==============================================================================
 # 3. Dynamic Material Generator (For packs lacking Godot .mat.tres)
 # ==============================================================================
 def ensure_pack_materials(project_root: str, categorized_files: Dict[str, List[str]]) -> int:
     generated_count = 0
-    # Map packs to their images and materials
     pack_images: Dict[str, List[str]] = {}
     pack_mats: Dict[str, List[str]] = {}
 
@@ -315,6 +382,8 @@ def ensure_pack_materials(project_root: str, categorized_files: Dict[str, List[s
             os.makedirs(mat_folder, exist_ok=True)
             for img_path in images:
                 stem = os.path.splitext(os.path.basename(img_path))[0]
+                if any(stem.lower().endswith(sfx) for sfx in ["_normals", "_normal", "_n", "_alpha", "_mask"]):
+                    continue
                 mat_file = os.path.join(mat_folder, f"{stem}.mat.tres")
                 if not os.path.exists(mat_file):
                     rel_tex = "res://" + os.path.relpath(img_path, project_root).replace("\\", "/")
@@ -329,7 +398,7 @@ def ensure_pack_materials(project_root: str, categorized_files: Dict[str, List[s
 [resource]
 resource_name = "{stem}"
 cull_mode = 0
-roughness = 0.85
+roughness = 0.8
 albedo_texture = ExtResource("1_tex")
 """
                     if is_triplanar:
@@ -341,34 +410,56 @@ albedo_texture = ExtResource("1_tex")
 
                     try:
                         with open(mat_file, "w", encoding="utf-8") as fh:
-                            fh.write(mat_content)
+                            fh.write(mat_content.strip() + "\n")
                         categorized_files["materials"].append(mat_file)
                         generated_count += 1
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        fail_warn(f"Failed to generate material {mat_file}: {exc}")
 
     return generated_count
 
 
 # ==============================================================================
-# 4. Universal FBX Binary Material Slot Parser & 4-Tier Matcher
+# 4. Universal FBX Binary Material Slot Parser & 7-Tier Matcher
 # ==============================================================================
-def extract_fbx_material_slots(fbx_path: str) -> Set[str]:
+def extract_fbx_material_slots(fbx_path: str, project_root: str = "") -> Tuple[Set[str], Set[str]]:
     slots = set()
+    missing_textures = set()
     try:
         with open(fbx_path, "rb") as fh:
-            data = fh.read()
-        for rx in (RE_FBX_MAT1, RE_FBX_MAT2, RE_FBX_MAT5):
-            for m in rx.findall(data):
-                slots.add(m.decode("ascii", errors="ignore"))
-        for rx in (RE_FBX_MAT3, RE_FBX_MAT4):
-            for m in rx.findall(data):
-                slots.add(m.decode("ascii", errors="ignore").strip())
-    except Exception:
-        pass
+            raw = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+
+        # Byte-safe in-place 4-byte string replacement (.psd/.tif/.psb -> .png)
+        # Only touches files that actually reference legacy formats; otherwise
+        # the mmap is scanned directly, keeping memory usage flat.
+        legacy_exts = (b".psd", b".PSD", b".psb", b".PSB", b".tif", b".TIF")
+        data = None
+        if any(raw.find(ext) != -1 for ext in legacy_exts):
+            raw.close()
+            with open(fbx_path, "rb") as fh:
+                data = fh.read()
+            for old_ext in legacy_exts:
+                data = data.replace(old_ext, b".png")
+            with open(fbx_path, "wb") as out_fh:
+                out_fh.write(data)
+        else:
+            data = raw
+        try:
+            for rx in (RE_FBX_MAT1, RE_FBX_MAT2, RE_FBX_MAT5):
+                for m in rx.findall(data):
+                    slots.add(m.decode("ascii", errors="ignore"))
+            for rx in (RE_FBX_MAT3, RE_FBX_MAT4):
+                for m in rx.findall(data):
+                    slots.add(m.decode("ascii", errors="ignore").strip())
+        finally:
+            raw.close()
+        if project_root:
+            missing_textures = find_missing_fbx_textures(fbx_path, project_root)
+    except Exception as exc:
+        fail_warn(f"Failed to extract material slots from {fbx_path}: {exc}")
 
     clean_slots = {s for s in slots if len(s) >= 2 and not s.startswith(" ")}
-    return clean_slots if clean_slots else {"default", "lambert1", "standardSurface1"}
+    return (clean_slots if clean_slots else {"default", "lambert1", "standardSurface1"}), missing_textures
 
 
 def resolve_slot_material(slot: str, fbx_name: str, mats: Dict[str, str], default_atlas: str) -> str:
@@ -397,7 +488,33 @@ def resolve_slot_material(slot: str, fbx_name: str, mats: Dict[str, str], defaul
                 if k in mats:
                     return mats[k]
 
-    # Tier 4: Dynamic Category & Keyword Intersection Matching
+    # Tier 4: Dynamic Semantic Token Scoring (Strict Numeric ID Match)
+    f_id = extract_numeric_id(f_low)
+    s_id = extract_numeric_id(s_low)
+    target_id = f_id or s_id
+    f_tokens = set(tokenize_string(f_low))
+
+    best_mat = None
+    best_score = 0
+    for mat_stem, mat_path in mats.items():
+        m_id = extract_numeric_id(mat_stem)
+        if target_id and m_id and target_id != m_id:
+            continue
+        m_tokens = set(tokenize_string(mat_stem))
+        score = 0
+        if target_id and target_id == m_id:
+            score += 10
+        score += len(f_tokens.intersection(m_tokens)) * 4
+        if ("building" in f_low or "bld" in f_low) and ("building" in mat_stem or "sheet" in mat_stem or "parallax" in mat_stem):
+            score += 4
+        if score > best_score:
+            best_score = score
+            best_mat = mat_path
+
+    if best_score >= 8 and best_mat:
+        return best_mat
+
+    # Tier 5: Dynamic Category & Keyword Intersection Matching
     combined_name = f"{f_low}_{s_low}"
     for mesh_tags, mat_keywords in SEMANTIC_CATEGORIES:
         if any(tag in combined_name for tag in mesh_tags):
@@ -406,19 +523,20 @@ def resolve_slot_material(slot: str, fbx_name: str, mats: Dict[str, str], defaul
                     if kw in k:
                         return v
 
-    # Tier 5: Asset Color Variant Suffix Matching (e.g. model ending in _01_b -> material with 01_b)
+    # Tier 6: Asset Color Variant Suffix Matching (e.g. model ending in _01_b -> material with 01_b)
     for sfx in ["_01_b", "_01_c", "_02_a", "_02_b", "_02_c", "_03_a", "_03_b", "_03_c", "_04_a", "_04_b", "_04_c"]:
         if f_low.endswith(sfx):
             for k, v in mats.items():
                 if sfx[1:] in k:
                     return v
 
-    # Tier 6: Pack Default Color Atlas
+    # Tier 7: Pack Default Color Atlas
     return default_atlas
 
 
+
 def clean_import_file(content: str) -> str:
-    content = content.replace("valid=false\n", "").replace("valid=false", "")
+    content = content.replace("valid=false\n", "valid=true\n").replace("valid=false", "valid=true")
     content = RE_FBX_LINES.sub("", content)
 
     sub_idx = content.find("_subresources=")
@@ -439,14 +557,24 @@ def clean_import_file(content: str) -> str:
     content = re.sub(r'import_script/path="[^"]*"', 'import_script/path=""', content)
     params_idx = content.find("[params]")
     if params_idx != -1:
-        content = content[:params_idx + 8] + "\nfbx/importer=0\nfbx/embedded_image_handling=0\nmaterials/extract=0" + content[params_idx + 8:]
+        if "fbx/importer=" not in content:
+            content = content[:params_idx + 8] + "\nfbx/importer=0\nfbx/embedded_image_handling=0\nmaterials/extract=0" + content[params_idx + 8:]
+        else:
+            content = re.sub(r'fbx/importer=\d+', 'fbx/importer=0', content)
+            content = re.sub(r'fbx/embedded_image_handling=\d+', 'fbx/embedded_image_handling=0', content)
 
     return content.strip()
 
 
-def map_all_fbx_materials(project_root: str, categorized_files: Dict[str, List[str]]) -> Tuple[int, int]:
+def map_all_fbx_materials(project_root: str, categorized_files: Dict[str, List[str]]) -> Tuple[int, int, int]:
     pack_materials: Dict[str, Dict[str, str]] = {}
     all_materials: Dict[str, str] = {}
+    pack_atlases: Dict[str, str] = {}
+
+    for img in categorized_files.get("images", []):
+        low = os.path.basename(img).lower()
+        if any(k in low for k in ["colormap", "texture_01", "base_color", "diffuse", "palette", "atlas", "main"]) and "dst" not in low:
+            pack_atlases.setdefault(get_pack_root(img), img)
 
     for p in categorized_files.get("materials", []):
         stem = os.path.basename(p).replace(".mat.tres", "").replace(".tres", "").lower()
@@ -457,16 +585,31 @@ def map_all_fbx_materials(project_root: str, categorized_files: Dict[str, List[s
 
     global_default = next((v for k, v in all_materials.items() if "01_a" in k or "colormap" in k), next(iter(all_materials.values()), ""))
 
-    def process_fbx(p: str) -> Tuple[int, int]:
+    def process_fbx(p: str) -> Tuple[int, int, int]:
         imp_path = p + ".import"
         if not os.path.exists(imp_path):
-            return 0, 0
+            return 0, 0, 0
 
         pack_dir = get_pack_root(p)
         mats = pack_materials.get(pack_dir, all_materials)
         default_atlas = next((v for k, v in mats.items() if "01_a" in k or "colormap" in k), global_default)
 
-        slots = extract_fbx_material_slots(p)
+        slots, missing_textures = extract_fbx_material_slots(p, project_root)
+        stubs_created = 0
+        for missing_target in missing_textures:
+            if not os.path.exists(missing_target):
+                os.makedirs(os.path.dirname(missing_target), exist_ok=True)
+                src_atlas = pack_atlases.get(get_pack_root(missing_target))
+                try:
+                    if HAS_PIL and src_atlas and os.path.exists(src_atlas):
+                        with Image.open(src_atlas) as img:
+                            save_image_safe(img, missing_target)
+                    else:
+                        save_image_safe(None, missing_target)
+                    stubs_created += 1
+                except Exception as exc:
+                    fail_warn(f"Failed to provision texture stub {missing_target}: {exc}")
+
         fbx_name = os.path.basename(p)
         mat_lines = [
             f'"{s}": {{\n"use_external/enabled": true,\n"use_external/path": "{resolve_slot_material(s, fbx_name, mats, default_atlas)}"\n}}'
@@ -478,7 +621,7 @@ def map_all_fbx_materials(project_root: str, categorized_files: Dict[str, List[s
             return clean_import_file(raw) + f'\n\n_subresources={{\n"materials": {{\n{sub_body}\n}}\n}}\n'
 
         transform_file(imp_path, _modify)
-        return 1, len(mat_lines)
+        return 1, len(mat_lines), stubs_created
 
     fbx_list = categorized_files.get("fbx", [])
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -486,7 +629,8 @@ def map_all_fbx_materials(project_root: str, categorized_files: Dict[str, List[s
 
     total_models = sum(r[0] for r in results)
     total_slots = sum(r[1] for r in results)
-    return total_models, total_slots
+    total_stubs = sum(r[2] for r in results)
+    return total_models, total_slots, total_stubs
 
 
 # ==============================================================================
@@ -646,6 +790,8 @@ def collect_project_files(project_root: str) -> Dict[str, List[str]]:
 
 
 def run_pipeline(project_root: str, package_path: Optional[str] = None, purge_cache: bool = False) -> None:
+    global _ERRORS
+    _ERRORS = 0
     project_root = os.path.abspath(project_root)
     print("==================================================", flush=True)
     print("       Godot 4 Universal Synty Automator          ", flush=True)
@@ -677,8 +823,10 @@ def run_pipeline(project_root: str, package_path: Optional[str] = None, purge_ca
     print(f"      - Auto-generated {gen_mats} StandardMaterial3D resources for unconfigured packs.", flush=True)
 
     print("\n[3/5] Deep Scanning & Mapping FBX Material Slots...", flush=True)
-    models, slots = map_all_fbx_materials(project_root, categorized_files)
+    models, slots, stubs = map_all_fbx_materials(project_root, categorized_files)
     print(f"      - Mapped {slots} material slots across {models} FBX models.", flush=True)
+    if stubs > 0:
+        print(f"      - Auto-provisioned {stubs} missing embedded texture/PSD stubs.", flush=True)
 
     print("\n[4/5] Rectifying Character Rigs & Multi-Mesh Visibility...", flush=True)
     fixed_skels, fixed_chars = fix_character_rigs_and_visibility(categorized_files)
@@ -702,6 +850,9 @@ def run_pipeline(project_root: str, package_path: Optional[str] = None, purge_ca
                     except Exception:
                         pass
         print(f"      - Purged {purged} cached .scn scene files.", flush=True)
+
+    if _ERRORS:
+        print(f"\n>> Finished with {_ERRORS} warning(s); review the [WARN] lines above.", flush=True)
 
     print("\n==================================================", flush=True)
     print("Universal Synty automation completed successfully!", flush=True)

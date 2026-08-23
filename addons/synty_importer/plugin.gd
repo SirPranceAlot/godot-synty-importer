@@ -50,12 +50,9 @@ func _run_automator(extra_args: Array) -> void:
 	
 	var output: Array = []
 	var exit_code: int = OS.execute("python3", args, output, true)
-	if exit_code == -1 or (exit_code != 0 and OS.get_name() == "Windows"):
-		var fallback_output: Array = []
-		var fallback_code: int = OS.execute("python", args, fallback_output, true)
-		if fallback_code == 0 or output.is_empty():
-			exit_code = fallback_code
-			output = fallback_output
+	if exit_code == -1:
+		output = []
+		exit_code = OS.execute("python", args, output, true)
 	
 	var out_str: String = "".join(output)
 	print(out_str)
