@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
 """
-Godot Synty Importer & Automator (Universal Parallel Engine)
-============================================================
+Godot Synty Importer & Automator (Universal Deterministic Engine)
+================================================================
 Autonomous, universal importer and configuration engine for all Synty Studios
 3D asset packs in Godot 4.
 
 Handles:
-  - Raw .unitypackage extraction
-  - Dynamic missing texture & PSD alias resolution
-  - Automated StandardMaterial3D generation for packs lacking Godot materials
-  - Deep FBX binary material slot parsing & 7-tier semantic material mapping
+  - Direct .unitypackage extraction & 100% deterministic YAML .mat / .prefab parsing
+  - Hierarchical pack-scoped material & prefab dependency isolation
+  - Automated StandardMaterial3D generation & corrupt placeholder material repair
+  - Deep FBX binary connection graph parsing & deterministic material slot mapping
   - Universal multi-character rig hierarchy & selective mesh visibility
   - Project-wide scene & resource UID synchronization
   - World-triplanar UV & normal map import normalization
+  - Headless cache purging for seamless Godot editor reloads
 
 Usage:
-    python3 synty_automator.py [--path /path/to/godot_project] [--package /path/to/pack.unitypackage] [--purge-cache]
+    python3 synty_automator.py [--path /path/to/godot_project] [--extract-all] [--package /path/to/pack.unitypackage] [--purge-cache]
 """
 
 import argparse
 import mmap
 import os
 import re
+import struct
 import sys
 import tarfile
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 try:
     from PIL import Image
@@ -36,49 +38,18 @@ except ImportError:
 IGNORED_DIRS = {".godot", ".git", "node_modules", ".import"}
 MAX_WORKERS = min(32, (os.cpu_count() or 4) * 4)
 
-# Pre-allocated valid 1x1 transparent RGBA PNG fallback bytes (70 bytes)
 PNG_1X1_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
     b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc````"
     b"\x00\x00\x00\x05\x00\x01\xa5\xf6E@\x00\x00\x00\x00IEND\xaeB`\x82"
 )
 
-# Pre-allocated valid 1x1 transparent RGBA uncompressed TGA fallback bytes (48 bytes)
 TGA_1X1_BYTES = (
     b"\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01\x00\x20\x08"
     b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00TRUEVISION-XFILE.\x00"
 )
 
-# Unified Semantic Category-to-Keyword mappings for dynamic material discovery
-SEMANTIC_CATEGORIES = [
-    # Holograms & UI
-    (["holo", "hologram"], ["hologram", "holo"]),
-    # Signs, Displays & Billboards
-    (["billboard", "neonsign", "sign", "poster", "screen", "monitor", "display"], ["billboard", "sign", "poster", "screen", "display", "paper"]),
-    # Glass & Transparency
-    (["glass", "window", "transparent"], ["glass", "window", "transparent"]),
-    # Fluids, Crystals & Ice
-    (["water", "waterfall", "fluid"], ["water", "waterfall", "fx_water"]),
-    (["ice", "crystal"], ["ice", "crystal", "glass"]),
-    # Debris & Waste
-    (["trash", "junk", "debris", "rubble"], ["trash", "junk"]),
-    # Special Effects & Beams
-    (["laser", "laser_grid"], ["laser"]),
-    (["fx_", "fx", "sparkle", "lightray", "sunbeam", "streak"], ["fx", "leaves", "lightray", "particle", "gradient"]),
-    # Environment, Skies & Modular Architecture
-    (["skybox", "skydome", "sky"], ["skybox", "skydome", "simplesky", "sky"]),
-    (["triplanar", "sm_bld_block", "parallax"], ["triplanar", "wall", "ground", "parallax"]),
-    (["wall", "a_wall", "brick", "stucco", "floor", "building"], ["wall", "brick", "floor", "building"]),
-    (["tree", "rock", "mountain", "nature", "wood", "foliage", "bark", "leaf"], ["tree", "rock", "mountain", "water", "nature", "wood"]),
-]
-
-# Precompiled Regexes for High-Performance Parsing
-RE_FBX_MAT1 = re.compile(b"([a-zA-Z0-9_-]+)\x00\x01Material")
-RE_FBX_MAT2 = re.compile(b"Material::([a-zA-Z0-9_-]+)")
-RE_FBX_MAT3 = re.compile(b"Material[\x00-\x10]+([a-zA-Z0-9_ -]{2,40})[\x00-\x10]+(?:FbxSurfaceLambert|FbxSurfacePhong|Material)")
-RE_FBX_MAT4 = re.compile(b"([a-zA-Z0-9_ -]{2,40})\x00\x01(?:FbxSurfaceLambert|FbxSurfacePhong)")
-RE_FBX_MAT5 = re.compile(b"Material\x00+([a-zA-Z0-9_-]+)")
-RE_FBX_EMBEDDED_TEX = re.compile(b'([a-zA-Z0-9_/\\\\.: -]{3,100}\\.(?:psd|psb|tif|tiff|png|tga|jpg|jpeg))', re.IGNORECASE)
+TEX_STRIP_WORDS = ("texture", "colormap", "basecolor", "diffuse", "palette", "atlas", "main")
 RE_FBX_LINES = re.compile(r"fbx/(?:importer|allow_geometry_helper_nodes|embedded_image_handling|naming_version)=.*\n?")
 RE_EXT_PATH = re.compile(r'path="([^"]+)"')
 RE_EXT_UID = re.compile(r'uid="([^"]+)"')
@@ -88,10 +59,6 @@ RE_RES_TEX = re.compile(r'path="res://([^"]+\.(?:png|psd|tga|jpg|jpeg|webp))"', 
 RE_CLEAN_PREFIX = re.compile(r"^(?:mat_|m_|shd_|lambert_|standardsurface_|pasted__)+", re.IGNORECASE)
 RE_CLEAN_SUFFIX = re.compile(r"(?:_sg\d+|sg\d+|\.mat|\.tres)+$", re.IGNORECASE)
 
-
-# ==============================================================================
-# Helper: Error Reporting
-# ==============================================================================
 _ERRORS = 0
 
 def fail_warn(message: str) -> None:
@@ -100,9 +67,6 @@ def fail_warn(message: str) -> None:
     print(f"      [WARN] {message}", file=sys.stderr, flush=True)
 
 
-# ==============================================================================
-# Helper: Atomic File Transformer
-# ==============================================================================
 def transform_file(file_path: str, transform_fn: Callable[[str], Optional[str]]) -> bool:
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
@@ -118,7 +82,8 @@ def transform_file(file_path: str, transform_fn: Callable[[str], Optional[str]])
 
 
 def get_pack_root(file_path: str) -> str:
-    parts = file_path.replace("\\", "/").split("/")
+    dir_path = file_path if os.path.isdir(file_path) else os.path.dirname(file_path)
+    parts = dir_path.replace("\\", "/").split("/")
     for i, p in enumerate(parts):
         low = p.lower()
         if low in ("synty", "assets") and i + 1 < len(parts):
@@ -127,87 +92,281 @@ def get_pack_root(file_path: str) -> str:
             return "/".join(parts[:i + 2])
         if low.startswith("polygon") or low.startswith("simple") or low.startswith("sidekick"):
             return "/".join(parts[:i + 1])
-    return os.path.dirname(os.path.dirname(file_path))
+    return dir_path
+
+
+def normalize_tex_stem(name: str) -> str:
+    low = name.lower()
+    for word in TEX_STRIP_WORDS:
+        low = low.replace(word, "")
+    digits = re.findall(r"\d+", low)
+    if len(digits) == 1 and len(digits[0]) == 1:
+        low = low.replace(digits[0], f"0{digits[0]}")
+    return re.sub(r"[^a-z0-9]", "", low)
+
+
+def is_default_atlas_key(k: str) -> bool:
+    low = k.lower()
+    if any(sub in low for sub in ["hack", "branch", "glass", "damage", "alt", "skin", "poster", "wall", "floor", "brick", "junk", "trash", "gradient", "holo"]):
+        return False
+    return low.endswith("01_a") or "colormap" in low or "palette" in low or "base_color" in low or "texture_01" in low or "01_a" in low
 
 
 # ==============================================================================
-# 1. UnityPackage Extractor
+# 1. UnityPackage Extraction & Deterministic YAML Parser
 # ==============================================================================
+def read_unitypackage_data(package_path: str) -> Tuple[Dict[str, str], Dict[str, bytes]]:
+    guid_to_path: Dict[str, str] = {}
+    guid_to_asset: Dict[str, bytes] = {}
+    try:
+        with tarfile.open(package_path, "r|*") as tar:
+            for member in tar:
+                if member.isfile():
+                    parts = member.name.replace("\\", "/").split("/")
+                    if len(parts) >= 2:
+                        guid, kind = parts[0], parts[1]
+                        if kind in ("pathname", "asset"):
+                            f = tar.extractfile(member)
+                            if f:
+                                content = f.read()
+                                if kind == "pathname":
+                                    guid_to_path[guid] = content.decode("utf-8", errors="ignore").splitlines()[0].strip()
+                                elif kind == "asset":
+                                    guid_to_asset[guid] = content
+    except Exception as exc:
+        fail_warn(f"Failed to read package {package_path}: {exc}")
+    return guid_to_path, guid_to_asset
+
+
 def extract_unitypackage(package_path: str, destination_root: str) -> int:
     if not os.path.exists(package_path):
         raise FileNotFoundError(f"Package not found: {package_path}")
 
+    guid_to_path, guid_to_asset = read_unitypackage_data(package_path)
     extracted = 0
-    with tarfile.open(package_path, "r:*") as tar:
-        entries = {}
-        for m in tar.getmembers():
-            parts = m.name.replace("\\", "/").split("/")
-            if len(parts) >= 2:
-                entries.setdefault(parts[0], {})[parts[1]] = m
-
-        for guid, items in entries.items():
-            if "pathname" in items and "asset" in items:
-                try:
-                    pf = tar.extractfile(items["pathname"])
-                    if not pf:
-                        continue
-                    rel = pf.read().decode("utf-8", errors="ignore").splitlines()[0].strip()
-                    if not rel:
-                        continue
-                    target = os.path.join(destination_root, rel)
-                    if not os.path.realpath(target).startswith(os.path.realpath(destination_root) + os.sep):
-                        fail_warn(f"Skipped unsafe path in package: {rel}")
-                        continue
-                    os.makedirs(os.path.dirname(target), exist_ok=True)
-                    af = tar.extractfile(items["asset"])
-                    if af:
-                        with open(target, "wb") as out:
-                            out.write(af.read())
-                        extracted += 1
-                except Exception as exc:
-                    fail_warn(f"Failed to extract package entry {guid}: {exc}")
+    for guid, rel in guid_to_path.items():
+        if not rel or guid not in guid_to_asset:
+            continue
+        target = os.path.join(destination_root, rel)
+        if not os.path.realpath(target).startswith(os.path.realpath(destination_root) + os.sep):
+            fail_warn(f"Skipped unsafe path in package: {rel}")
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        try:
+            with open(target, "wb") as out:
+                out.write(guid_to_asset[guid])
+            extracted += 1
+        except Exception as exc:
+            fail_warn(f"Failed to extract {rel}: {exc}")
     return extracted
 
 
-# ==============================================================================
-# Helper: FBX Embedded Texture Reference Scanner
-# ==============================================================================
-def find_missing_fbx_textures(fbx_path: str, project_root: str) -> Set[str]:
-    missing = set()
-    try:
-        fbx_dir = os.path.dirname(fbx_path)
-        with open(fbx_path, "rb") as fh:
-            with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
-                for m in RE_FBX_EMBEDDED_TEX.findall(data):
-                    s = m.decode("utf-8", errors="ignore").replace("\\", "/").strip()
-                    filename = os.path.basename(s)
-                    sibling = os.path.normpath(os.path.join(fbx_dir, filename))
-                    if not os.path.exists(sibling):
-                        missing.add(sibling)
-                    if ":" not in s and not s.startswith("/"):
-                        rel_target = os.path.normpath(os.path.join(fbx_dir, s))
-                        if not os.path.exists(rel_target):
-                            missing.add(rel_target)
-                    else:
-                        # Strip drive letter and leading slashes for absolute paths
-                        clean_s = re.sub(r"^[a-zA-Z]:[/\\]+", "", s).lstrip("/")
-                        p_target = os.path.normpath(os.path.join(project_root, clean_s))
-                        if not os.path.exists(p_target):
-                            missing.add(p_target)
-                        assets_target = os.path.normpath(os.path.join(project_root, "Assets", clean_s))
-                        if not os.path.exists(assets_target):
-                            missing.add(assets_target)
-    except Exception as exc:
-        fail_warn(f"Failed to scan {fbx_path}: {exc}")
-    return missing
+def parse_unity_mat_yaml(raw_yaml: str, guid_to_path: Dict[str, str]) -> Dict[str, Any]:
+    texs: Dict[str, str] = {}
+    for block in re.finditer(r"- (_[A-Za-z0-9_]+):\s*\n\s*m_Texture:\s*\{fileID:\s*2800000,\s*guid:\s*([a-f0-9]{32})", raw_yaml):
+        prop_name, tguid = block.group(1), block.group(2)
+        if tguid in guid_to_path:
+            texs[prop_name] = guid_to_path[tguid]
+
+    colors: Dict[str, Tuple[float, float, float, float]] = {}
+    for block in re.finditer(r"(_[A-Za-z0-9_]+):\s*\{r:\s*([\d.-]+),\s*g:\s*([\d.-]+),\s*b:\s*([\d.-]+),\s*a:\s*([\d.-]+)\}", raw_yaml):
+        pname = block.group(1)
+        colors[pname] = (float(block.group(2)), float(block.group(3)), float(block.group(4)), float(block.group(5)))
+
+    floats: Dict[str, float] = {}
+    for block in re.finditer(r"- (_[A-Za-z0-9_]+):\s*([\d.-]+)", raw_yaml):
+        pname, val = block.group(1), float(block.group(2))
+        floats[pname] = val
+
+    is_transparent = "RenderType: Transparent" in raw_yaml or "_SURFACE_TYPE_TRANSPARENT" in raw_yaml
+    is_cutout = "RenderType: TransparentCutout" in raw_yaml or "_ALPHATEST_ON" in raw_yaml or floats.get("_AlphaClip", 0) == 1
+    is_holo = "Hologram" in raw_yaml or "_Neon_Color" in colors or "_Holo_Lines" in texs
+
+    return {
+        "texs": texs,
+        "colors": colors,
+        "floats": floats,
+        "is_transparent": is_transparent,
+        "is_cutout": is_cutout,
+        "is_holo": is_holo,
+    }
+
+
+def resolve_texture_res_path(tex_rel_path: Optional[str], project_root: str, pack_dir: str) -> Optional[str]:
+    if not tex_rel_path:
+        return None
+    clean_rel = tex_rel_path.replace("\\", "/").lstrip("/")
+    full_path = os.path.join(project_root, clean_rel)
+    if os.path.exists(full_path):
+        return "res://" + clean_rel
+    fname = os.path.basename(clean_rel)
+    if fname:
+        for root, _, files in os.walk(pack_dir):
+            for f in files:
+                if f.lower() == fname.lower():
+                    found_rel = os.path.relpath(os.path.join(root, f), project_root).replace("\\", "/")
+                    return "res://" + found_rel
+    return "res://" + clean_rel
+
+
+def generate_godot_material_from_unity(
+    mat_stem: str,
+    parsed: Dict[str, Any],
+    project_root: str,
+    pack_dir: str
+) -> str:
+    texs = parsed["texs"]
+    colors = parsed["colors"]
+    floats = parsed["floats"]
+    is_holo = parsed["is_holo"]
+    is_transparent = parsed["is_transparent"]
+    is_cutout = parsed["is_cutout"]
+
+    ext_resources = []
+    properties = []
+    res_idx = 1
+
+    # 1. Albedo Texture & Color
+    albedo_res_id = None
+    albedo_tex_path = texs.get("_Albedo_Map") or texs.get("_MainTex") or texs.get("_BaseMap")
+    if not albedo_tex_path and is_holo:
+        albedo_tex_path = texs.get("_Holo_Lines")
+
+    if albedo_tex_path:
+        rel_albedo = resolve_texture_res_path(albedo_tex_path, project_root, pack_dir)
+        if rel_albedo:
+            albedo_res_id = f"{res_idx}_tex"
+            ext_resources.append(f'[ext_resource type="Texture2D" path="{rel_albedo}" id="{albedo_res_id}"]')
+            properties.append(f'albedo_texture = ExtResource("{albedo_res_id}")')
+            res_idx += 1
+
+    base_col = colors.get("_Base_Color") or colors.get("_BaseColor") or colors.get("_Color")
+    if base_col and not is_holo:
+        properties.append(f'albedo_color = Color({base_col[0]:.6g}, {base_col[1]:.6g}, {base_col[2]:.6g}, {base_col[3]:.6g})')
+
+    # 2. Transparency, Cull, and Shading
+    if is_cutout:
+        properties.append("transparency = 2")
+        properties.append(f'alpha_scissor_threshold = {floats.get("_Cutoff", 0.5):.6g}')
+    elif is_transparent or is_holo:
+        properties.append("transparency = 1")
+
+    cull_val = floats.get("_Cull", 2)
+    if is_holo or cull_val == 0:
+        properties.append("cull_mode = 2")
+    elif cull_val == 1:
+        properties.append("cull_mode = 1")
+    else:
+        properties.append("cull_mode = 0")
+
+    if is_holo:
+        properties.append("shading_mode = 0")
+
+    # 3. Normal Map
+    norm_path = texs.get("_Normal_Map") or texs.get("_BumpMap")
+    if norm_path:
+        rel_norm = resolve_texture_res_path(norm_path, project_root, pack_dir)
+        if rel_norm:
+            ext_resources.append(f'[ext_resource type="Texture2D" path="{rel_norm}" id="{res_idx}_normal"]')
+            properties.append("normal_enabled = true")
+            properties.append(f'normal_texture = ExtResource("{res_idx}_normal")')
+            res_idx += 1
+
+    # 4. Occlusion (AO)
+    ao_path = texs.get("_OcclusionMap") or texs.get("_AO_Map")
+    if ao_path:
+        rel_ao = resolve_texture_res_path(ao_path, project_root, pack_dir)
+        if rel_ao:
+            ext_resources.append(f'[ext_resource type="Texture2D" path="{rel_ao}" id="{res_idx}_ao"]')
+            properties.append("ao_enabled = true")
+            properties.append(f'ao_texture = ExtResource("{res_idx}_ao")')
+            res_idx += 1
+
+    # 5. Emission
+    emissive_tex_path = texs.get("_Emission_Mask") or texs.get("_Emission_Map") or texs.get("_EmissionMap")
+    neon_col = colors.get("_Neon_Color") or colors.get("_Neon_Colour_01")
+    em_col = colors.get("_EmissionColor") or colors.get("_Emission_Color")
+
+    has_emission = bool(emissive_tex_path or (neon_col and max(neon_col[:3]) > 0.01) or (em_col and max(em_col[:3]) > 0.01))
+    if has_emission or is_holo:
+        properties.append("emission_enabled = true")
+        final_em_col = neon_col or em_col or (1.0, 1.0, 1.0, 1.0)
+        properties.append(f'emission = Color({final_em_col[0]:.6g}, {final_em_col[1]:.6g}, {final_em_col[2]:.6g}, 1)')
+        em_power = floats.get("_Emission_Power", floats.get("_EmissionStrength", 2.0))
+        if is_holo and em_power < 1.0:
+            em_power = 2.0
+        properties.append(f'emission_energy_multiplier = {em_power:.6g}')
+        if emissive_tex_path:
+            rel_em = resolve_texture_res_path(emissive_tex_path, project_root, pack_dir)
+            if rel_em:
+                ext_resources.append(f'[ext_resource type="Texture2D" path="{rel_em}" id="{res_idx}_emission"]')
+                properties.append(f'emission_texture = ExtResource("{res_idx}_emission")')
+                res_idx += 1
+        elif albedo_res_id and is_holo:
+            properties.append(f'emission_texture = ExtResource("{albedo_res_id}")')
+
+    # 6. Roughness & Metallic
+    smooth = floats.get("_Smoothness", floats.get("_Glossiness", 0.2))
+    rough = max(0.0, min(1.0, 1.0 - smooth))
+    properties.append(f'roughness = {rough:.6g}')
+    metallic = floats.get("_Metallic", 0.0)
+    if metallic > 0.01:
+        properties.append(f'metallic = {metallic:.6g}')
+
+    if "triplanar" in mat_stem.lower() or "wall" in mat_stem.lower():
+        properties.append("uv1_triplanar = true\nuv1_world_triplanar = true\nuv1_scale = Vector3(0.5, 0.5, 0.5)")
+
+    mat_content = f"""[gd_resource type="StandardMaterial3D" load_steps={len(ext_resources) + 1} format=3]
+
+"""
+    for r in ext_resources:
+        mat_content += r + "\n"
+    mat_content += f"""
+[resource]
+resource_name = "{mat_stem}"
+"""
+    for p in properties:
+        mat_content += p + "\n"
+
+    return mat_content
 
 
 # ==============================================================================
-# 2. Universal Texture Classifier & Dynamic Missing Resource Resolver
+# 2. Project File Discovery & Texture Sanitization
 # ==============================================================================
-def save_image_safe(img, target_path: str) -> None:
+def collect_project_files(project_root: str) -> Dict[str, List[str]]:
+    categories: Dict[str, List[str]] = {
+        "images": [],
+        "materials": [],
+        "fbx": [],
+        "imports": [],
+        "tscn": [],
+        "unitypackages": [],
+    }
+    for root, dirs, files in os.walk(project_root):
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+        for f in files:
+            low = f.lower()
+            full_path = os.path.join(root, f)
+            if any(low.endswith(ext) for ext in [".png", ".tga", ".jpg", ".jpeg", ".webp"]):
+                categories["images"].append(full_path)
+            elif low.endswith(".tres") or low.endswith(".mat") or low.endswith(".material"):
+                categories["materials"].append(full_path)
+            elif low.endswith(".fbx"):
+                categories["fbx"].append(full_path)
+            elif low.endswith(".import"):
+                categories["imports"].append(full_path)
+            elif low.endswith(".tscn"):
+                categories["tscn"].append(full_path)
+            elif low.endswith(".unitypackage"):
+                categories["unitypackages"].append(full_path)
+    return categories
+
+
+def save_image_safe(img: Optional[Any], target_path: str) -> None:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     ext = os.path.splitext(target_path)[1].lower()
+
     if not HAS_PIL or img is None:
         try:
             with open(target_path, "wb") as fh:
@@ -230,21 +389,20 @@ def sanitize_and_resolve_textures(project_root: str, categorized_files: Dict[str
     fixed_formats = aliases_created = normalized_imports = 0
     ext_to_fmt = {".png": b"\x89PNG\r\n\x1a\n", ".jpg": b"\xff\xd8\xff", ".jpeg": b"\xff\xd8\xff"}
 
-    # Group color atlases by pack root
     pack_atlases: Dict[str, str] = {}
     all_atlases: List[str] = []
 
     for p in categorized_files.get("images", []):
         low = os.path.basename(p).lower()
         pack_dir = get_pack_root(p)
-        is_atlas = any(k in low for k in ["colormap", "texture_01", "base_color", "diffuse", "palette", "atlas", "main"]) and "dst" not in low
+        is_atlas = any(k in low for k in ["colormap", "texture_01", "base_color", "diffuse", "palette", "atlas", "main"]) and "dst" not in low and not any(sub in low for sub in ["hack", "branch", "glass"])
         if is_atlas:
             pack_atlases.setdefault(pack_dir, p)
             all_atlases.append(p)
 
     global_default_atlas = next(iter(pack_atlases.values()), all_atlases[0] if all_atlases else None)
 
-    # 1. Format check & repair (misnamed files)
+    # 1. Format check & repair
     def check_image(p: str) -> int:
         if not HAS_PIL:
             return 0
@@ -266,7 +424,7 @@ def sanitize_and_resolve_textures(project_root: str, categorized_files: Dict[str
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         fixed_formats = sum(ex.map(check_image, categorized_files.get("images", [])))
 
-    # 2. Dynamic Missing Texture Discovery across all .tres, .mat.tres, .tscn, and .fbx
+    # 2. Missing Texture Discovery
     referenced_textures: Set[str] = set()
 
     def scan_tex_refs(p: str) -> None:
@@ -279,16 +437,9 @@ def sanitize_and_resolve_textures(project_root: str, categorized_files: Dict[str
             pass
 
     scan_targets = categorized_files.get("materials", []) + categorized_files.get("tscn", [])
-    scan_fbx = categorized_files.get("fbx", [])
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         list(ex.map(scan_tex_refs, scan_targets))
-        for missing in ex.map(lambda p: find_missing_fbx_textures(p, project_root), scan_fbx):
-            for t in missing:
-                rel = os.path.relpath(t, project_root).replace("\\", "/")
-                if not rel.startswith(".."):
-                    referenced_textures.add(rel)
 
-    # Dynamic Provisioning of Missing Textures
     for rel in referenced_textures:
         full_target = os.path.join(project_root, rel)
         if not os.path.exists(full_target):
@@ -304,7 +455,42 @@ def sanitize_and_resolve_textures(project_root: str, categorized_files: Dict[str
             except Exception:
                 pass
 
-    # 3. Texture .import normalizer (sRGB / normal map compression)
+    # 3. FBX Embedded Texture Dependencies
+    for fbx_p in categorized_files.get("fbx", []):
+        fbx_d = os.path.dirname(fbx_p)
+        g = parse_fbx_graph(fbx_p)
+        needed_files = set()
+        for vid in g.get("videos", {}).values():
+            if vid:
+                needed_files.add(os.path.basename(vid.replace("\\", "/")))
+        for tex_name, fname in g.get("textures", {}).values():
+            if fname:
+                needed_files.add(os.path.basename(fname.replace("\\", "/")))
+
+        for req in needed_files:
+            if not req:
+                continue
+            fbx_target = os.path.join(fbx_d, req)
+            if not os.path.exists(fbx_target):
+                pack_dir = get_pack_root(fbx_target)
+                req_stem = os.path.splitext(req)[0].lower()
+                matched_tex = None
+                for t_candidate in categorized_files.get("images", []):
+                    if get_pack_root(t_candidate) == pack_dir and os.path.splitext(os.path.basename(t_candidate))[0].lower() == req_stem:
+                        matched_tex = t_candidate
+                        break
+                src_atlas = matched_tex or pack_atlases.get(pack_dir) or global_default_atlas
+                try:
+                    if HAS_PIL and src_atlas and os.path.exists(src_atlas):
+                        with Image.open(src_atlas) as img:
+                            save_image_safe(img, fbx_target)
+                    else:
+                        save_image_safe(None, fbx_target)
+                    aliases_created += 1
+                except Exception:
+                    pass
+
+    # 4. Texture .import normalizer
     def check_texture_import(p: str) -> int:
         if "normal" in p.lower():
             return 0
@@ -319,167 +505,357 @@ def sanitize_and_resolve_textures(project_root: str, categorized_files: Dict[str
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         normalized_imports = sum(ex.map(check_texture_import, tex_imports))
 
-    # 4. Triplanar material normalizer (enables world-triplanar projection)
-    def check_triplanar_material(p: str) -> int:
-        if "triplanar" not in p.lower():
-            return 0
-        def _modify(txt: str) -> str:
-            txt = txt.replace("uv1_triplanar = false", "uv1_triplanar = true")
-            txt = txt.replace("uv1_world_triplanar = false", "uv1_world_triplanar = true")
-            txt = txt.replace("uv1_scale = Vector3(1, 1, 1)", "uv1_scale = Vector3(0.5, 0.5, 0.5)")
-            return txt
-        return 1 if transform_file(p, _modify) else 0
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        list(ex.map(check_triplanar_material, categorized_files.get("materials", [])))
-
     return fixed_formats, aliases_created, normalized_imports
 
 
 # ==============================================================================
-# Helper: String Tokenizer & Numeric ID Extractor
+# 3. Deep FBX Binary Connection Graph Parser
 # ==============================================================================
-PREFIX_STRIP = (
-    "sm_", "sk_", "t_", "m_", "mat_", "gen_", "bld_", "prop_", "env_",
-    "chr_", "wep_", "veh_", "fx_", "polygon_", "polygon", "generic_"
-)
-
-def extract_numeric_id(s: str) -> str:
-    parts = s.lower().split("_")
-    for p in parts:
-        if p.isdigit() and len(p) >= 2:
-            return p
-    digits = re.findall(r"\d{2,}", s)
-    return digits[0] if digits else ""
-
-def tokenize_string(s: str) -> List[str]:
-    clean = s.lower()
-    for prefix in PREFIX_STRIP:
-        if clean.startswith(prefix):
-            clean = clean[len(prefix):]
+def read_fbx_properties(data: bytes, offset: int, num_props: int) -> Tuple[List[Any], int]:
+    props = []
+    curr = offset
+    for _ in range(num_props):
+        if curr >= len(data):
             break
-    clean = re.sub(r"[_.\-\s]+", " ", clean)
-    return [t.strip() for t in clean.split(" ") if t.strip()]
-
-# ==============================================================================
-# 3. Dynamic Material Generator (For packs lacking Godot .mat.tres)
-# ==============================================================================
-def ensure_pack_materials(project_root: str, categorized_files: Dict[str, List[str]]) -> int:
-    generated_count = 0
-    pack_images: Dict[str, List[str]] = {}
-    pack_mats: Dict[str, List[str]] = {}
-
-    for img in categorized_files.get("images", []):
-        pack_images.setdefault(get_pack_root(img), []).append(img)
-
-    for mat in categorized_files.get("materials", []):
-        pack_mats.setdefault(get_pack_root(mat), []).append(mat)
-
-    for pack_dir, images in pack_images.items():
-        existing_mats = pack_mats.get(pack_dir, [])
-        if len(existing_mats) == 0 and len(images) > 0:
-            mat_folder = os.path.join(pack_dir, "Materials")
-            os.makedirs(mat_folder, exist_ok=True)
-            for img_path in images:
-                stem = os.path.splitext(os.path.basename(img_path))[0]
-                if any(stem.lower().endswith(sfx) for sfx in ["_normals", "_normal", "_n", "_alpha", "_mask"]):
-                    continue
-                mat_file = os.path.join(mat_folder, f"{stem}.mat.tres")
-                if not os.path.exists(mat_file):
-                    rel_tex = "res://" + os.path.relpath(img_path, project_root).replace("\\", "/")
-                    is_triplanar = "triplanar" in stem.lower() or "wall" in stem.lower()
-                    is_emissive = "emissive" in stem.lower() or "glow" in stem.lower()
-                    is_glass = "glass" in stem.lower() or "transparent" in stem.lower()
-
-                    mat_content = f"""[gd_resource type="StandardMaterial3D" load_steps=2 format=3]
-
-[ext_resource type="Texture2D" path="{rel_tex}" id="1_tex"]
-
-[resource]
-resource_name = "{stem}"
-cull_mode = 0
-roughness = 0.8
-albedo_texture = ExtResource("1_tex")
-"""
-                    if is_triplanar:
-                        mat_content += "uv1_triplanar = true\nuv1_world_triplanar = true\nuv1_scale = Vector3(0.5, 0.5, 0.5)\n"
-                    if is_emissive:
-                        mat_content += "emission_enabled = true\nemission = Color(1, 1, 1, 1)\nemission_energy_multiplier = 2.0\nemission_texture = ExtResource(\"1_tex\")\n"
-                    if is_glass:
-                        mat_content += "transparency = 1\nalbedo_color = Color(1, 1, 1, 0.5)\n"
-
-                    try:
-                        with open(mat_file, "w", encoding="utf-8") as fh:
-                            fh.write(mat_content.strip() + "\n")
-                        categorized_files["materials"].append(mat_file)
-                        generated_count += 1
-                    except Exception as exc:
-                        fail_warn(f"Failed to generate material {mat_file}: {exc}")
-
-    return generated_count
-
-
-# ==============================================================================
-# 4. Universal FBX Binary Material Slot Parser & 7-Tier Matcher
-# ==============================================================================
-def extract_fbx_material_slots(fbx_path: str, project_root: str = "") -> Tuple[Set[str], Set[str]]:
-    slots = set()
-    missing_textures = set()
-    try:
-        with open(fbx_path, "rb") as fh:
-            raw = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
-
-        # Byte-safe in-place 4-byte string replacement (.psd/.tif/.psb -> .png)
-        # Only touches files that actually reference legacy formats; otherwise
-        # the mmap is scanned directly, keeping memory usage flat.
-        legacy_exts = (b".psd", b".PSD", b".psb", b".PSB", b".tif", b".TIF")
-        data = None
-        if any(raw.find(ext) != -1 for ext in legacy_exts):
-            raw.close()
-            with open(fbx_path, "rb") as fh:
-                data = fh.read()
-            for old_ext in legacy_exts:
-                data = data.replace(old_ext, b".png")
-            with open(fbx_path, "wb") as out_fh:
-                out_fh.write(data)
+        type_code = chr(data[curr])
+        curr += 1
+        if type_code == 'Y':
+            props.append(struct.unpack("<h", data[curr:curr + 2])[0])
+            curr += 2
+        elif type_code == 'C':
+            props.append(struct.unpack("<?", data[curr:curr + 1])[0])
+            curr += 1
+        elif type_code == 'I':
+            props.append(struct.unpack("<i", data[curr:curr + 4])[0])
+            curr += 4
+        elif type_code == 'F':
+            props.append(struct.unpack("<f", data[curr:curr + 4])[0])
+            curr += 4
+        elif type_code == 'D':
+            props.append(struct.unpack("<d", data[curr:curr + 8])[0])
+            curr += 8
+        elif type_code == 'L':
+            props.append(struct.unpack("<q", data[curr:curr + 8])[0])
+            curr += 8
+        elif type_code in ('R', 'S'):
+            length = struct.unpack("<I", data[curr:curr + 4])[0]
+            curr += 4
+            val = data[curr:curr + length].decode("utf-8", errors="ignore")
+            props.append(val)
+            curr += length
+        elif type_code in ('f', 'd', 'l', 'i', 'b'):
+            arr_len, enc, comp_len = struct.unpack("<III", data[curr:curr + 12])
+            curr += 12 + comp_len
+            props.append(None)
         else:
-            data = raw
-        try:
-            for rx in (RE_FBX_MAT1, RE_FBX_MAT2, RE_FBX_MAT5):
-                for m in rx.findall(data):
-                    slots.add(m.decode("ascii", errors="ignore"))
-            for rx in (RE_FBX_MAT3, RE_FBX_MAT4):
-                for m in rx.findall(data):
-                    slots.add(m.decode("ascii", errors="ignore").strip())
-        finally:
-            raw.close()
-        if project_root:
-            missing_textures = find_missing_fbx_textures(fbx_path, project_root)
-    except Exception as exc:
-        fail_warn(f"Failed to extract material slots from {fbx_path}: {exc}")
-
-    clean_slots = {s for s in slots if len(s) >= 2 and not s.startswith(" ")}
-    return (clean_slots if clean_slots else {"default", "lambert1", "standardSurface1"}), missing_textures
+            break
+    return props, curr
 
 
-def resolve_slot_material(slot: str, fbx_name: str, mats: Dict[str, str], default_atlas: str) -> str:
+def parse_fbx_graph(file_path: str) -> Dict[str, Any]:
+    try:
+        with open(file_path, "rb") as fh:
+            data = fh.read()
+    except Exception:
+        return {}
+
+    if not data.startswith(b"Kaydara FBX Binary"):
+        return {}
+
+    version = struct.unpack("<I", data[23:27])[0]
+    is_64bit = version >= 7500
+
+    def parse_node(offset: int):
+        if is_64bit:
+            if offset + 25 > len(data):
+                return None, len(data)
+            end_offset, num_props, prop_len, name_len = struct.unpack("<QQQB", data[offset:offset + 25])
+            header_size = 25
+        else:
+            if offset + 13 > len(data):
+                return None, len(data)
+            end_offset, num_props, prop_len, name_len = struct.unpack("<IIIB", data[offset:offset + 13])
+            header_size = 13
+        if end_offset == 0:
+            return None, offset + header_size
+        name = data[offset + header_size:offset + header_size + name_len].decode("ascii", errors="ignore")
+        prop_offset = offset + header_size + name_len
+        props, _ = read_fbx_properties(data, prop_offset, num_props)
+        child_offset = prop_offset + prop_len
+        children = []
+        while child_offset < end_offset:
+            child, next_off = parse_node(child_offset)
+            if child:
+                children.append(child)
+                child_offset = next_off
+            else:
+                break
+        return (name, props, children), end_offset
+
+    root = []
+    off = 27
+    while off < len(data):
+        node, next_off = parse_node(off)
+        if node:
+            root.append(node)
+            off = next_off
+        else:
+            break
+
+    objects = next((n for n in root if n[0] == "Objects"), None)
+    materials: Dict[int, str] = {}
+    textures: Dict[int, Tuple[str, str]] = {}
+    videos: Dict[int, str] = {}
+    if objects:
+        for c in objects[2]:
+            c_name, c_props, c_children = c
+            if c_name == "Material" and len(c_props) >= 2:
+                mat_id = c_props[0]
+                mat_name = str(c_props[1]).split(chr(0))[0].split("::")[-1]
+                materials[mat_id] = mat_name
+            elif c_name == "Texture" and len(c_props) >= 2:
+                tex_id = c_props[0]
+                tex_name = str(c_props[1]).split(chr(0))[0].split("::")[-1]
+                fname = ""
+                for sub in c_children:
+                    if sub[0] in ("RelativeFilename", "FileName") and sub[1]:
+                        fname = str(sub[1][0])
+                        break
+                textures[tex_id] = (tex_name, fname)
+            elif c_name == "Video" and len(c_props) >= 2:
+                vid_id = c_props[0]
+                fname = ""
+                for sub in c_children:
+                    if sub[0] in ("RelativeFilename", "Filename") and sub[1]:
+                        fname = str(sub[1][0])
+                        break
+                videos[vid_id] = fname
+
+    connections_node = next((n for n in root if n[0] == "Connections"), None)
+    mat_to_textures: Dict[int, List[str]] = {}
+    if connections_node:
+        for c in connections_node[2]:
+            c_props = c[1]
+            if len(c_props) >= 3 and c_props[0] == "OO":
+                child_id, parent_id = c_props[1], c_props[2]
+                if parent_id in materials and child_id in textures:
+                    tname, tfname = textures[child_id]
+                    vfname = videos.get(child_id, "")
+                    final_path = tfname or vfname or tname
+                    mat_to_textures.setdefault(parent_id, []).append(final_path)
+
+    slot_to_tex: Dict[str, List[str]] = {}
+    for mid, mname in materials.items():
+        slot_to_tex[mname] = mat_to_textures.get(mid, [])
+
+    return {
+        "materials": materials,
+        "textures": textures,
+        "videos": videos,
+        "mat_to_textures": slot_to_tex
+    }
+
+
+# ==============================================================================
+# 4. Deterministic Material Synchronization & Slot Resolution
+# ==============================================================================
+def synchronize_unitypackage_materials(
+    project_root: str,
+    categorized_files: Dict[str, List[str]]
+) -> Tuple[int, Dict[str, Dict[str, List[str]]]]:
+    updated_mats = 0
+    pack_prefab_mats: Dict[str, Dict[str, List[str]]] = {}
+
+    def add_prefab_mats(pack_key: str, model_key: str, mats: List[str]) -> None:
+        norm_pack = os.path.normpath(pack_key)
+        pack_dict = pack_prefab_mats.setdefault(norm_pack, {})
+        existing = pack_dict.setdefault(model_key, [])
+        for m in mats:
+            if m not in existing:
+                existing.append(m)
+
+    # 1. Parse Unity Packages
+    for pkg in categorized_files.get("unitypackages", []):
+        guid_to_path, guid_to_asset = read_unitypackage_data(pkg)
+        if not guid_to_path:
+            continue
+
+        mat_guid_to_res: Dict[str, str] = {}
+        for guid, rel_path in guid_to_path.items():
+            if rel_path.endswith(".mat") and guid in guid_to_asset:
+                raw_yaml = guid_to_asset[guid].decode("utf-8", errors="ignore")
+                parsed = parse_unity_mat_yaml(raw_yaml, guid_to_path)
+                mat_stem = os.path.splitext(os.path.basename(rel_path))[0]
+                pack_dir = get_pack_root(os.path.normpath(os.path.join(project_root, rel_path)))
+                
+                target_mat = os.path.join(project_root, rel_path + ".tres")
+                if not os.path.exists(os.path.join(project_root, rel_path)):
+                    rel_clean = rel_path.replace("\\", "/").lstrip("/")
+                    parts = rel_clean.split("/")
+                    mat_idx = -1
+                    for idx, pt in enumerate(parts):
+                        if pt.lower() == "materials":
+                            mat_idx = idx
+                            break
+                    if mat_idx != -1:
+                        mat_sub = "/".join(parts[mat_idx:])
+                        target_mat = os.path.join(pack_dir, mat_sub + ".tres")
+
+                res_p = "res://" + os.path.relpath(target_mat, project_root).replace("\\", "/")
+                mat_guid_to_res[guid] = res_p
+
+                mat_content = generate_godot_material_from_unity(mat_stem, parsed, project_root, pack_dir)
+                os.makedirs(os.path.dirname(target_mat), exist_ok=True)
+                try:
+                    with open(target_mat, "w", encoding="utf-8") as out:
+                        out.write(mat_content)
+                    if target_mat not in categorized_files["materials"]:
+                        categorized_files["materials"].append(target_mat)
+                    updated_mats += 1
+                except Exception as exc:
+                    fail_warn(f"Failed to write material {target_mat}: {exc}")
+
+            elif rel_path.endswith(".prefab") and guid in guid_to_asset:
+                raw_yaml = guid_to_asset[guid].decode("utf-8", errors="ignore")
+                pack_dir = get_pack_root(os.path.normpath(os.path.join(project_root, rel_path)))
+                
+                mat_paths = []
+                for block in re.finditer(r"m_Materials:\s*\n((?:\s*-\s*\{fileID:[^\}]+\}\s*\n?)+)", raw_yaml):
+                    for mg in re.findall(r"guid:\s*([a-f0-9]{32})", block.group(1)):
+                        res_p = mat_guid_to_res.get(mg)
+                        if not res_p:
+                            mp = guid_to_path.get(mg)
+                            if mp and mp.endswith(".mat"):
+                                res_p = "res://" + mp.replace("\\", "/") + ".tres"
+                        if res_p:
+                            mat_paths.append(res_p)
+
+                for block in re.finditer(r"propertyPath:\s*m_Materials\.Array\.data\[(\d+)\]\s*\n\s*value:\s*\n\s*objectReference:\s*\{fileID:[^,]+,\s*guid:\s*([a-f0-9]{32})", raw_yaml):
+                    idx, mg = int(block.group(1)), block.group(2)
+                    res_p = mat_guid_to_res.get(mg)
+                    if not res_p:
+                        mp = guid_to_path.get(mg)
+                        if mp and mp.endswith(".mat"):
+                            res_p = "res://" + mp.replace("\\", "/") + ".tres"
+                    if res_p:
+                        while len(mat_paths) <= idx:
+                            mat_paths.append(res_p)
+                        mat_paths[idx] = res_p
+
+                if mat_paths:
+                    mesh_guids = re.findall(r"m_Mesh:\s*\{fileID:[^,]+,\s*guid:\s*([a-f0-9]{32})", raw_yaml)
+                    for msh in mesh_guids:
+                        mesh_path = guid_to_path.get(msh, "")
+                        if mesh_path:
+                            model_stem = os.path.splitext(os.path.basename(mesh_path))[0].lower()
+                            add_prefab_mats(pack_dir, model_stem, mat_paths)
+                    prefab_stem = os.path.splitext(os.path.basename(rel_path))[0].lower()
+                    add_prefab_mats(pack_dir, prefab_stem, mat_paths)
+
+    # 2. Synchronize standalone on-disk .mat files
+    for mpath in categorized_files.get("materials", []):
+        if mpath.endswith(".mat"):
+            target_mat = mpath + ".tres"
+            pack_dir = get_pack_root(mpath)
+            mat_stem = os.path.splitext(os.path.basename(mpath))[0]
+            try:
+                with open(mpath, "r", encoding="utf-8", errors="ignore") as fh:
+                    raw_yaml = fh.read()
+                parsed = parse_unity_mat_yaml(raw_yaml, {})
+                mat_content = generate_godot_material_from_unity(mat_stem, parsed, project_root, pack_dir)
+                os.makedirs(os.path.dirname(target_mat), exist_ok=True)
+                with open(target_mat, "w", encoding="utf-8") as out:
+                    out.write(mat_content)
+                if target_mat not in categorized_files["materials"]:
+                    categorized_files["materials"].append(target_mat)
+                updated_mats += 1
+            except Exception:
+                pass
+
+    # 3. Synchronize .prefab.tscn overrides
+    for p in categorized_files.get("tscn", []):
+        if p.endswith(".prefab.tscn"):
+            pack_dir = get_pack_root(os.path.normpath(p))
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                    txt = fh.read()
+                ext_mats = {}
+                for line in txt.splitlines():
+                    if line.startswith("[ext_resource") and "Material" in line:
+                        id_m = re.search(r'id="([^"]+)"', line)
+                        path_m = re.search(r'path="([^"]+)"', line)
+                        if id_m and path_m:
+                            ext_mats[id_m.group(1)] = path_m.group(1)
+                mesh_matches = re.findall(r'path="res://[^"]*?/([a-zA-Z0-9_-]+)\.(?:mesh|fbx)"', txt)
+                p_stem = os.path.basename(p).replace(".prefab.tscn", "").lower()
+                if ext_mats:
+                    m_list = list(ext_mats.values())
+                    add_prefab_mats(pack_dir, p_stem, m_list)
+                    for msh in mesh_matches:
+                        add_prefab_mats(pack_dir, msh.lower(), m_list)
+            except Exception:
+                pass
+
+    # 4. Cleanup stale flat materials in root Materials/ folder if nested version exists
+    for root, dirs, files in os.walk(project_root):
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+        if os.path.basename(root).lower() == "materials" and len(dirs) > 0:
+            for f in files:
+                if f.endswith(".mat.tres"):
+                    for sub in dirs:
+                        nested_cand = os.path.join(root, sub, f)
+                        nested_mat = os.path.join(root, sub, f[:-5])
+                        if os.path.exists(nested_cand) or os.path.exists(nested_mat):
+                            flat_file = os.path.join(root, f)
+                            try:
+                                os.remove(flat_file)
+                                if flat_file in categorized_files["materials"]:
+                                    categorized_files["materials"].remove(flat_file)
+                            except Exception:
+                                pass
+                            break
+
+    return updated_mats, pack_prefab_mats
+
+
+def resolve_slot_material(
+    slot: str,
+    connected_tex: List[str],
+    mats: Dict[str, str],
+    tex_to_mat: Dict[str, str],
+    default_atlas: str,
+    prefab_mats: Optional[List[str]] = None,
+    slot_index: int = 0
+) -> str:
+    if prefab_mats and len(prefab_mats) > 0:
+        if slot_index < len(prefab_mats):
+            return prefab_mats[slot_index]
+        return prefab_mats[0]
+
+    skip_sfx = ("_normal", "_normals", "_n", "_emissive", "_emission", "emissive", "emission", "_occlusion", "_ao", "_mask", "_alpha")
+    diffuse_candidates = [t for t in connected_tex if not any(sfx in os.path.basename(t).lower() for sfx in skip_sfx)]
+    search_order = diffuse_candidates if diffuse_candidates else connected_tex
+
+    for tex in search_order:
+        low = os.path.basename(tex).lower()
+        stem = normalize_tex_stem(low)
+        if stem in tex_to_mat:
+            return tex_to_mat[stem]
+
     s_low = slot.lower()
-    f_low = fbx_name.lower().replace(".fbx", "")
-
-    # Tier 1: Exact Match
     if s_low in mats:
         return mats[s_low]
 
-    # Tier 2: Normalized Name Match (strip DCC prefixes and suffixes)
     norm_slot = RE_CLEAN_PREFIX.sub("", s_low)
     norm_slot = RE_CLEAN_SUFFIX.sub("", norm_slot)
     if norm_slot in mats:
         return mats[norm_slot]
-    for k, v in mats.items():
-        if norm_slot in k or k in norm_slot:
-            return v
+    norm_stem = normalize_tex_stem(norm_slot)
+    if norm_stem in tex_to_mat:
+        return tex_to_mat[norm_stem]
+    if norm_stem in mats:
+        return mats[norm_stem]
 
-    # Tier 3: Dynamic Numbered Wall/Building Slot Matcher (e.g. A_Wall14 -> wall_14)
     if any(term in s_low for term in ["wall", "brick", "building"]):
         num_m = RE_NUM_EXT.search(slot)
         if num_m:
@@ -488,345 +864,349 @@ def resolve_slot_material(slot: str, fbx_name: str, mats: Dict[str, str], defaul
                 if k in mats:
                     return mats[k]
 
-    # Tier 4: Dynamic Semantic Token Scoring (Strict Numeric ID Match)
-    f_id = extract_numeric_id(f_low)
-    s_id = extract_numeric_id(s_low)
-    target_id = f_id or s_id
-    f_tokens = set(tokenize_string(f_low))
-
-    best_mat = None
-    best_score = 0
-    for mat_stem, mat_path in mats.items():
-        m_id = extract_numeric_id(mat_stem)
-        if target_id and m_id and target_id != m_id:
-            continue
-        m_tokens = set(tokenize_string(mat_stem))
-        score = 0
-        if target_id and target_id == m_id:
-            score += 10
-        score += len(f_tokens.intersection(m_tokens)) * 4
-        if ("building" in f_low or "bld" in f_low) and ("building" in mat_stem or "sheet" in mat_stem or "parallax" in mat_stem):
-            score += 4
-        if score > best_score:
-            best_score = score
-            best_mat = mat_path
-
-    if best_score >= 8 and best_mat:
-        return best_mat
-
-    # Tier 5: Dynamic Category & Keyword Intersection Matching
-    combined_name = f"{f_low}_{s_low}"
-    for mesh_tags, mat_keywords in SEMANTIC_CATEGORIES:
-        if any(tag in combined_name for tag in mesh_tags):
-            for kw in mat_keywords:
-                for k, v in mats.items():
-                    if kw in k:
-                        return v
-
-    # Tier 6: Asset Color Variant Suffix Matching (e.g. model ending in _01_b -> material with 01_b)
-    for sfx in ["_01_b", "_01_c", "_02_a", "_02_b", "_02_c", "_03_a", "_03_b", "_03_c", "_04_a", "_04_b", "_04_c"]:
-        if f_low.endswith(sfx):
-            for k, v in mats.items():
-                if sfx[1:] in k:
-                    return v
-
-    # Tier 7: Pack Default Color Atlas
     return default_atlas
 
 
-
-def clean_import_file(content: str) -> str:
-    content = content.replace("valid=false\n", "valid=true\n").replace("valid=false", "valid=true")
-    content = RE_FBX_LINES.sub("", content)
-
-    sub_idx = content.find("_subresources=")
-    if sub_idx != -1:
-        brace_start = content.find("{", sub_idx)
-        if brace_start != -1:
-            depth, end_idx = 0, len(content)
-            for i in range(brace_start, len(content)):
-                if content[i] == "{":
-                    depth += 1
-                elif content[i] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        end_idx = i + 1
-                        break
-            content = content[:sub_idx].rstrip() + "\n" + content[end_idx:].lstrip()
-
-    content = re.sub(r'import_script/path="[^"]*"', 'import_script/path=""', content)
-    params_idx = content.find("[params]")
-    if params_idx != -1:
-        if "fbx/importer=" not in content:
-            content = content[:params_idx + 8] + "\nfbx/importer=0\nfbx/embedded_image_handling=0\nmaterials/extract=0" + content[params_idx + 8:]
-        else:
-            content = re.sub(r'fbx/importer=\d+', 'fbx/importer=0', content)
-            content = re.sub(r'fbx/embedded_image_handling=\d+', 'fbx/embedded_image_handling=0', content)
-
-    return content.strip()
-
-
-def map_all_fbx_materials(project_root: str, categorized_files: Dict[str, List[str]]) -> Tuple[int, int, int]:
+def map_all_fbx_materials(
+    project_root: str,
+    categorized_files: Dict[str, List[str]],
+    pack_prefab_mats: Dict[str, Dict[str, List[str]]]
+) -> Tuple[int, int]:
     pack_materials: Dict[str, Dict[str, str]] = {}
     all_materials: Dict[str, str] = {}
-    pack_atlases: Dict[str, str] = {}
-
-    for img in categorized_files.get("images", []):
-        low = os.path.basename(img).lower()
-        if any(k in low for k in ["colormap", "texture_01", "base_color", "diffuse", "palette", "atlas", "main"]) and "dst" not in low:
-            pack_atlases.setdefault(get_pack_root(img), img)
+    pack_tex_to_mat: Dict[str, Dict[str, str]] = {}
+    global_tex_to_mat: Dict[str, str] = {}
 
     for p in categorized_files.get("materials", []):
         stem = os.path.basename(p).replace(".mat.tres", "").replace(".tres", "").lower()
+        norm_mat_stem = normalize_tex_stem(stem)
         rel = "res://" + os.path.relpath(p, project_root).replace("\\", "/")
-        pack_dir = get_pack_root(p)
-        pack_materials.setdefault(pack_dir, {})[stem] = rel
+        pack_dir = os.path.normpath(get_pack_root(p))
+
+        p_mats = pack_materials.setdefault(pack_dir, {})
+        p_mats[stem] = rel
+        p_mats[norm_mat_stem] = rel
         all_materials[stem] = rel
+        all_materials[norm_mat_stem] = rel
 
-    global_default = next((v for k, v in all_materials.items() if "01_a" in k or "colormap" in k), next(iter(all_materials.values()), ""))
+        p_tex = pack_tex_to_mat.setdefault(pack_dir, {})
+        p_tex[stem] = rel
+        p_tex[norm_mat_stem] = rel
+        global_tex_to_mat[stem] = rel
+        global_tex_to_mat[norm_mat_stem] = rel
 
-    def process_fbx(p: str) -> Tuple[int, int, int]:
-        imp_path = p + ".import"
-        if not os.path.exists(imp_path):
-            return 0, 0, 0
+    for p in categorized_files.get("images", []):
+        base = os.path.basename(p)
+        stem = os.path.splitext(base)[0].lower()
+        norm_stem = normalize_tex_stem(stem)
+        pack_dir = os.path.normpath(get_pack_root(p))
+        p_mats = pack_materials.get(pack_dir, {})
+        mat_path = p_mats.get(stem) or p_mats.get(norm_stem) or all_materials.get(stem) or all_materials.get(norm_stem)
+        if mat_path:
+            pack_tex_to_mat.setdefault(pack_dir, {})[stem] = mat_path
+            pack_tex_to_mat.setdefault(pack_dir, {})[norm_stem] = mat_path
+            global_tex_to_mat[stem] = mat_path
+            global_tex_to_mat[norm_stem] = mat_path
 
-        pack_dir = get_pack_root(p)
-        mats = pack_materials.get(pack_dir, all_materials)
-        default_atlas = next((v for k, v in mats.items() if "01_a" in k or "colormap" in k), global_default)
+    total_models = total_slots = 0
 
-        slots, missing_textures = extract_fbx_material_slots(p, project_root)
-        stubs_created = 0
-        for missing_target in missing_textures:
-            if not os.path.exists(missing_target):
-                os.makedirs(os.path.dirname(missing_target), exist_ok=True)
-                src_atlas = pack_atlases.get(get_pack_root(missing_target))
-                try:
-                    if HAS_PIL and src_atlas and os.path.exists(src_atlas):
-                        with Image.open(src_atlas) as img:
-                            save_image_safe(img, missing_target)
-                    else:
-                        save_image_safe(None, missing_target)
-                    stubs_created += 1
-                except Exception as exc:
-                    fail_warn(f"Failed to provision texture stub {missing_target}: {exc}")
+    def process_fbx(fbx_path: str) -> Tuple[int, int]:
+        imp_path = fbx_path + ".import"
+        pack_dir = os.path.normpath(get_pack_root(fbx_path))
+        model_stem = os.path.splitext(os.path.basename(fbx_path))[0].lower()
 
-        fbx_name = os.path.basename(p)
-        mat_lines = [
-            f'"{s}": {{\n"use_external/enabled": true,\n"use_external/path": "{resolve_slot_material(s, fbx_name, mats, default_atlas)}"\n}}'
-            for s in sorted(slots)
-        ]
+        p_mats = pack_materials.get(pack_dir, all_materials)
+        p_tex = pack_tex_to_mat.get(pack_dir, global_tex_to_mat)
+        
+        pref_mats = pack_prefab_mats.get(pack_dir, {}).get(model_stem)
+        if not pref_mats:
+            for p_key, p_dict in pack_prefab_mats.items():
+                if model_stem in p_dict:
+                    pref_mats = p_dict[model_stem]
+                    break
 
-        sub_body = ",\n".join(mat_lines)
-        def _modify(raw: str) -> str:
-            return clean_import_file(raw) + f'\n\n_subresources={{\n"materials": {{\n{sub_body}\n}}\n}}\n'
+        default_atlas = ""
+        for k, v in p_mats.items():
+            if is_default_atlas_key(k):
+                default_atlas = v
+                break
+        if not default_atlas:
+            default_atlas = next(iter(p_mats.values()), next(iter(all_materials.values()), ""))
 
-        transform_file(imp_path, _modify)
-        return 1, len(mat_lines), stubs_created
+        content = ""
+        if os.path.exists(imp_path):
+            with open(imp_path, "r", encoding="utf-8", errors="ignore") as fh:
+                content = fh.read()
+        else:
+            rel_source = "res://" + os.path.relpath(fbx_path, project_root).replace("\\", "/")
+            base_f = os.path.basename(fbx_path)
+            content = f"""[remap]
 
-    fbx_list = categorized_files.get("fbx", [])
+importer="scene"
+importer_version=1
+type="PackedScene"
+
+[deps]
+
+source_file="{rel_source}"
+dest_files=["res://.godot/imported/{base_f}.scn"]
+
+[params]
+
+nodes/root_type=""
+nodes/root_name=""
+nodes/root_script=null
+nodes/apply_root_scale=true
+nodes/root_scale=1.0
+nodes/import_as_skeleton_bones=false
+nodes/use_name_suffixes=true
+nodes/use_node_type_suffixes=true
+meshes/ensure_tangents=true
+meshes/generate_lods=true
+meshes/create_shadow_meshes=true
+meshes/light_baking=1
+meshes/lightmap_texel_size=0.2
+meshes/force_disable_compression=false
+skins/use_named_skins=true
+animation/import=true
+animation/fps=30
+animation/trimming=true
+animation/remove_immutable_tracks=true
+animation/import_rest_as_RESET=false
+import_script/path=""
+materials/extract=0
+materials/extract_format=0
+materials/extract_path=""
+_subresources={{
+"materials": {{}}
+}}
+fbx/importer=0
+fbx/allow_geometry_helper_nodes=false
+fbx/embedded_image_handling=0
+fbx/naming_version=1
+"""
+
+        if "importer=\"scene\"" not in content and "type=\"PackedScene\"" not in content:
+            return 0, 0
+
+        g = parse_fbx_graph(fbx_path)
+        slots = list(g.get("materials", {}).values())
+        if not slots:
+            slots_match = re.findall(r'"([^"]+)":\s*\{\s*"use_external/enabled"', content)
+            slots = slots_match if slots_match else ["Default_Material"]
+
+        mat_dict: Dict[str, Dict[str, Any]] = {}
+        for idx, s in enumerate(slots):
+            conn_tex = g.get("mat_to_textures", {}).get(s, [])
+            res_mat = resolve_slot_material(
+                s, conn_tex, p_mats, p_tex, default_atlas,
+                prefab_mats=pref_mats, slot_index=idx
+            )
+            if res_mat:
+                mat_dict[s] = {
+                    "use_external/enabled": True,
+                    "use_external/path": res_mat
+                }
+
+        sub_json_lines = ['_subresources={\n"materials": {']
+        for i, (k, v) in enumerate(mat_dict.items()):
+            comma = "," if i < len(mat_dict) - 1 else ""
+            sub_json_lines.append(f'"{k}": {{\n"use_external/enabled": true,\n"use_external/path": "{v["use_external/path"]}"\n}}{comma}')
+        sub_json_lines.append("}\n}")
+        new_sub = "\n".join(sub_json_lines)
+
+        if "_subresources={" in content:
+            content = re.sub(r"_subresources=\{[\s\S]*?\n\}", new_sub, content)
+        else:
+            content += "\n" + new_sub + "\n"
+
+        if "fbx/embedded_image_handling" not in content:
+            params_idx = content.find("[params]")
+            if params_idx != -1:
+                content = content[:params_idx + 8] + "\nfbx/importer=0\nfbx/embedded_image_handling=0\nmaterials/extract=0" + content[params_idx + 8:]
+            else:
+                content += "\nfbx/importer=0\nfbx/embedded_image_handling=0\nmaterials/extract=0\n"
+
+        with open(imp_path, "w", encoding="utf-8") as out:
+            out.write(content)
+
+        return 1, len(mat_dict)
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        results = list(ex.map(process_fbx, fbx_list))
+        for m_cnt, s_cnt in ex.map(process_fbx, categorized_files.get("fbx", [])):
+            total_models += m_cnt
+            total_slots += s_cnt
 
-    total_models = sum(r[0] for r in results)
-    total_slots = sum(r[1] for r in results)
-    total_stubs = sum(r[2] for r in results)
-    return total_models, total_slots, total_stubs
+    return total_models, total_slots
 
 
 # ==============================================================================
-# 5. Universal Character Rig & Mesh Visibility Resolver
+# 5. Character Rig Rectification & Selective Visibility
 # ==============================================================================
 def fix_character_rigs_and_visibility(categorized_files: Dict[str, List[str]]) -> Tuple[int, int]:
-    # 1. Universal Skeleton Renaming (GeneralSkeleton -> Skeleton3D)
-    def process_tscn(p: str) -> int:
+    fixed_skels = fixed_chars = 0
+    tscn_files = categorized_files.get("tscn", [])
+
+    def fix_tscn(p: str) -> Tuple[int, int]:
+        s_fix = c_fix = 0
         def _modify(txt: str) -> Optional[str]:
-            if "GeneralSkeleton" not in txt:
-                return None
-            txt = txt.replace('parent="GeneralSkeleton"', 'parent="Skeleton3D"')
-            txt = txt.replace('"GeneralSkeleton"', '"Skeleton3D"')
-            txt = txt.replace("GeneralSkeleton/", "Skeleton3D/")
-            return txt
-        return 1 if transform_file(p, _modify) else 0
+            nonlocal s_fix, c_fix
+            changed = False
+            if 'type="GeneralSkeleton"' in txt or 'type="Skeleton"' in txt:
+                txt = re.sub(r'type="(?:GeneralSkeleton|Skeleton)"', 'type="Skeleton3D"', txt)
+                s_fix = 1
+                changed = True
+            if "Character" in p or "SK_" in p:
+                parts_seen = set()
+                new_lines = []
+                for line in txt.splitlines():
+                    if line.startswith("[node name="):
+                        m = re.search(r'name="([^"]+)"', line)
+                        if m:
+                            name = m.group(1)
+                            prefix = name.split("_")[0] if "_" in name else name
+                            if prefix in parts_seen:
+                                line += "\nvisible = false"
+                                c_fix = 1
+                                changed = True
+                            else:
+                                parts_seen.add(prefix)
+                    new_lines.append(line)
+                txt = "\n".join(new_lines)
+            return txt if changed else None
+
+        if transform_file(p, _modify):
+            return s_fix, c_fix
+        return 0, 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        fixed_skels = sum(ex.map(process_tscn, categorized_files.get("tscn", [])))
+        for s, c in ex.map(fix_tscn, tscn_files):
+            fixed_skels += s
+            fixed_chars += c
 
-    # 2. Universal Character Mesh Visibility Selection in Prefabs
-    def process_prefab(p: str) -> int:
-        stem = os.path.basename(p).split(".")[0]
-        def _modify_prefab(txt: str) -> Optional[str]:
-            # Check for multi-character meshes under Skeleton3D
-            char_nodes = re.findall(r'\[node name="([^"]+)"[^\]]*parent="Skeleton3D"[^\]]*\]', txt)
-            if len(char_nodes) <= 1:
-                return None
-            modified = False
-            for cname in char_nodes:
-                is_target = (cname.lower() == stem.lower() or cname.lower() in stem.lower())
-                m = re.search(rf'\[node name="{cname}"[^\]]*parent="Skeleton3D"[^\]]*\]', txt)
-                if not m:
-                    continue
-                n_start = m.start()
-                next_n = txt.find("[node name=", m.end())
-                sec = txt[n_start:next_n] if next_n != -1 else txt[n_start:]
-
-                if "visible =" in sec:
-                    new_sec = re.sub(r"visible\s*=\s*(?:true|false)", f"visible = {str(is_target).lower()}", sec)
-                else:
-                    lines = sec.splitlines()
-                    lines.insert(1, f"visible = {str(is_target).lower()}")
-                    new_sec = "\n".join(lines)
-
-                if new_sec != sec:
-                    txt = txt[:n_start] + new_sec + (txt[next_n:] if next_n != -1 else "")
-                    modified = True
-            return txt if modified else None
-        return 1 if transform_file(p, _modify_prefab) else 0
-
-    prefabs = [p for p in categorized_files.get("tscn", []) if p.endswith(".prefab.tscn")]
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        fixed_prefabs = sum(ex.map(process_prefab, prefabs))
-
-    return fixed_skels, fixed_prefabs
+    return fixed_skels, fixed_chars
 
 
 # ==============================================================================
-# 6. Scene & Resource UID Synchronizer
+# 6. UID Synchronization Engine
 # ==============================================================================
 def synchronize_uids(project_root: str, categorized_files: Dict[str, List[str]]) -> Tuple[int, int]:
     path_to_uid: Dict[str, str] = {}
+    uid_to_path: Dict[str, str] = {}
+    scan_targets = categorized_files.get("materials", []) + categorized_files.get("imports", []) + categorized_files.get("tscn", [])
 
     def extract_uid(p: str) -> Optional[Tuple[str, str]]:
         try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                first_chunk = fh.read(1024)
+            uid_m = RE_EXT_UID.search(first_chunk)
+            if not uid_m:
+                return None
+            uid = uid_m.group(1)
             if p.endswith(".import"):
-                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
-                    txt = fh.read()
-                uid_m = RE_EXT_UID.search(txt)
-                src_m = RE_SRC_FILE.search(txt)
-                if uid_m and src_m:
-                    return src_m.group(1), uid_m.group(1)
-            elif p.endswith(".tscn"):
-                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
-                    fline = fh.readline()
-                uid_m = RE_EXT_UID.search(fline)
-                if uid_m:
-                    rel = "res://" + os.path.relpath(p, project_root).replace("\\", "/")
-                    return rel, uid_m.group(1)
+                src_m = RE_SRC_FILE.search(first_chunk)
+                if src_m:
+                    return src_m.group(1), uid
+                base = p[:-7]
+                rel = "res://" + os.path.relpath(base, project_root).replace("\\", "/")
+                return rel, uid
+            else:
+                rel = "res://" + os.path.relpath(p, project_root).replace("\\", "/")
+                return rel, uid
         except Exception:
-            pass
-        return None
+            return None
 
-    scan_targets = categorized_files.get("imports", []) + categorized_files.get("tscn", [])
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         for res in ex.map(extract_uid, scan_targets):
             if res:
                 path_to_uid[res[0]] = res[1]
+                uid_to_path[res[1]] = res[0]
 
-    def sync_scene(p: str) -> Tuple[int, int]:
-        u_fixed = [0]
+    synced_scenes = fixed_uids = 0
+
+    def sync_scene(p: str) -> int:
         def _modify(txt: str) -> Optional[str]:
-            if "[ext_resource" not in txt:
-                return None
-            lines = txt.splitlines()
-            modified = False
+            changed = False
             new_lines = []
-            for line in lines:
-                if line.startswith("[ext_resource"):
-                    p_m = RE_EXT_PATH.search(line)
-                    u_m = RE_EXT_UID.search(line)
-                    if p_m and p_m.group(1) in path_to_uid:
-                        target_uid = path_to_uid[p_m.group(1)]
-                        if u_m:
-                            if u_m.group(1) != target_uid:
-                                line = line.replace(u_m.group(1), target_uid)
-                                modified = True
-                                u_fixed[0] += 1
-                        else:
-                            line = line.replace("[ext_resource ", f'[ext_resource uid="{target_uid}" ')
-                            modified = True
-                            u_fixed[0] += 1
+            for line in txt.splitlines():
+                if line.startswith("[ext_resource") and 'uid="uid://' in line:
+                    path_m = RE_EXT_PATH.search(line)
+                    uid_m = RE_EXT_UID.search(line)
+                    if path_m and uid_m:
+                        res_p = path_m.group(1)
+                        curr_uid = uid_m.group(1)
+                        if res_p in path_to_uid:
+                            actual_uid = path_to_uid[res_p]
+                            if actual_uid != curr_uid:
+                                line = line.replace(f'uid="{curr_uid}"', f'uid="{actual_uid}"')
+                                changed = True
+                        elif curr_uid in uid_to_path:
+                            real_path = uid_to_path[curr_uid]
+                            if real_path != res_p:
+                                line = line.replace(f'path="{res_p}"', f'path="{real_path}"')
+                                changed = True
                 new_lines.append(line)
-            return "\n".join(new_lines) + "\n" if modified else None
+            return "\n".join(new_lines) if changed else None
 
-        modified = transform_file(p, _modify)
-        return (1 if modified else 0), u_fixed[0]
+        return 1 if transform_file(p, _modify) else 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        results = list(ex.map(sync_scene, categorized_files.get("tscn", [])))
+        synced_scenes = sum(ex.map(sync_scene, categorized_files.get("tscn", [])))
 
-    updated_scenes = sum(r[0] for r in results)
-    uids_fixed = sum(r[1] for r in results)
-    return updated_scenes, uids_fixed
+    return synced_scenes, len(path_to_uid)
 
 
 # ==============================================================================
-# Pipeline Coordinator
+# Pipeline Execution & CLI
 # ==============================================================================
-def collect_project_files(project_root: str) -> Dict[str, List[str]]:
-    categorized = {
-        "fbx": [],
-        "tscn": [],
-        "imports": [],
-        "images": [],
-        "materials": [],
-    }
-    image_exts = {".png", ".tga", ".jpg", ".jpeg", ".webp"}
-
-    for root, dirs, files in os.walk(project_root):
-        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
-        for f in files:
-            full_path = os.path.join(root, f)
-            if f.endswith(".fbx"):
-                categorized["fbx"].append(full_path)
-            elif f.endswith(".tscn"):
-                categorized["tscn"].append(full_path)
-            elif f.endswith(".import"):
-                categorized["imports"].append(full_path)
-            elif f.endswith(".mat.tres") or (f.endswith(".tres") and not f.endswith((".mesh.tres", ".animation.tres", ".skin.tres", ".skeleton.tres"))):
-                categorized["materials"].append(full_path)
-            elif os.path.splitext(f)[1].lower() in image_exts:
-                categorized["images"].append(full_path)
-
-    return categorized
-
-
-def run_pipeline(project_root: str, package_path: Optional[str] = None, purge_cache: bool = False) -> None:
-    global _ERRORS
-    _ERRORS = 0
-    project_root = os.path.abspath(project_root)
-    print("==================================================", flush=True)
-    print("       Godot 4 Universal Synty Automator          ", flush=True)
-    print("==================================================", flush=True)
+def run_pipeline(
+    project_root: str,
+    package_path: Optional[str] = None,
+    extract_all: bool = False,
+    purge_cache: bool = False
+) -> None:
+    print("==================================================")
+    print("       Godot 4 Universal Synty Automator          ")
+    print("==================================================")
     print(f"Target Project: {project_root}", flush=True)
 
     if not os.path.exists(os.path.join(project_root, "project.godot")):
         print(f"ERROR: No project.godot found at '{project_root}'!", flush=True)
         sys.exit(1)
 
-    if package_path:
-        print(f"\n[0/5] Extracting UnityPackage: {os.path.basename(package_path)}...", flush=True)
-        extracted = extract_unitypackage(package_path, project_root)
-        print(f"      - Extracted {extracted} files into project.", flush=True)
-
-    # Fast single-pass filesystem scan
     categorized_files = collect_project_files(project_root)
 
+    # Step 0: Package Extraction
+    packages_to_extract = []
+    if package_path:
+        packages_to_extract.append(package_path)
+    elif extract_all:
+        packages_to_extract.extend(categorized_files.get("unitypackages", []))
+
+    if packages_to_extract:
+        print(f"\n[0/5] Extracting {len(packages_to_extract)} UnityPackage(s)...", flush=True)
+        for pkg in packages_to_extract:
+            print(f"      - Unpacking {os.path.basename(pkg)}...", flush=True)
+            extracted = extract_unitypackage(pkg, project_root)
+            print(f"        -> Extracted {extracted} files.", flush=True)
+        # Refresh file index after extraction
+        categorized_files = collect_project_files(project_root)
+
     print("\n[1/5] Sanitizing Textures & Resolving Missing Resources...", flush=True)
-    if not HAS_PIL:
-        print("      (Note: Pillow library not detected. Install with 'pip install Pillow' to enable image re-encoding.)", flush=True)
     fixed_tex, aliases, norm_tex = sanitize_and_resolve_textures(project_root, categorized_files)
     print(f"      - Fixed misnamed image formats: {fixed_tex}", flush=True)
     print(f"      - Generated missing texture & PSD alias stubs: {aliases}", flush=True)
     print(f"      - Normalized sRGB & normal map import settings: {norm_tex}", flush=True)
 
-    print("\n[2/5] Checking Pack Materials & Generating Missing StandardMaterial3D...", flush=True)
-    gen_mats = ensure_pack_materials(project_root, categorized_files)
-    print(f"      - Auto-generated {gen_mats} StandardMaterial3D resources for unconfigured packs.", flush=True)
+    print("\n[2/5] Parsing Unity Package Materials & Rebuilding StandardMaterial3D...", flush=True)
+    rebuilt_mats, pack_prefab_mappings = synchronize_unitypackage_materials(project_root, categorized_files)
+    total_bindings = sum(len(m) for m in pack_prefab_mappings.values())
+    print(f"      - Synchronized & generated {rebuilt_mats} materials from Unity definitions.", flush=True)
+    print(f"      - Loaded {total_bindings} deterministic model-to-material prefab bindings across {len(pack_prefab_mappings)} packs.", flush=True)
 
     print("\n[3/5] Deep Scanning & Mapping FBX Material Slots...", flush=True)
-    models, slots, stubs = map_all_fbx_materials(project_root, categorized_files)
+    models, slots = map_all_fbx_materials(project_root, categorized_files, pack_prefab_mappings)
     print(f"      - Mapped {slots} material slots across {models} FBX models.", flush=True)
-    if stubs > 0:
-        print(f"      - Auto-provisioned {stubs} missing embedded texture/PSD stubs.", flush=True)
 
     print("\n[4/5] Rectifying Character Rigs & Multi-Mesh Visibility...", flush=True)
     fixed_skels, fixed_chars = fix_character_rigs_and_visibility(categorized_files)
@@ -863,10 +1243,11 @@ def run_pipeline(project_root: str, package_path: Optional[str] = None, purge_ca
 def main():
     parser = argparse.ArgumentParser(description="Universal Synty asset importer and configuration engine for Godot 4.")
     parser.add_argument("--path", type=str, default=os.getcwd(), help="Path to Godot project root.")
-    parser.add_argument("--package", "-pkg", type=str, default=None, help="Path to .unitypackage file to extract and import.")
+    parser.add_argument("--package", "-pkg", type=str, default=None, help="Path to specific .unitypackage file to extract.")
+    parser.add_argument("--extract-all", action="store_true", help="Extract all .unitypackage archives found in the project.")
     parser.add_argument("--purge-cache", action="store_true", help="Delete cached .scn files in .godot/imported.")
     args = parser.parse_args()
-    run_pipeline(args.path, package_path=args.package, purge_cache=args.purge_cache)
+    run_pipeline(args.path, package_path=args.package, extract_all=args.extract_all, purge_cache=args.purge_cache)
 
 
 if __name__ == "__main__":
