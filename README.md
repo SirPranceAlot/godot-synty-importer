@@ -45,15 +45,19 @@ When importing Synty asset packs into Godot 4, several recurring engine incompat
    ```
 3. **Import a `.unitypackage` directly:**
    ```bash
-   python3 synty_automator.py --path "/path/to/godot_project" --package "/path/to/PolygonCyberCity.unitypackage"
+   python3 addons/synty_importer/synty_automator.py --path "/path/to/godot_project" --package "/path/to/PolygonCyberCity.unitypackage"
+   ```
+   *Or extract all packages found in the project:*
+   ```bash
+   python3 addons/synty_importer/synty_automator.py --path "/path/to/godot_project" --extract-all
    ```
    *Or run against an already-extracted asset pack:*
    ```bash
-   python3 synty_automator.py --path "/path/to/godot_project"
+   python3 addons/synty_importer/synty_automator.py --path "/path/to/godot_project"
    ```
    *Optional: purge stale compiled `.scn` cache:*
    ```bash
-   python3 synty_automator.py --path "/path/to/godot_project" --purge-cache
+   python3 addons/synty_importer/synty_automator.py --path "/path/to/godot_project" --purge-cache
    ```
 
 ### Method 2: Godot 4 Editor Plugin
@@ -81,13 +85,12 @@ The editor plugin executes the background automator using Python. Ensure your sy
 
 ```text
 godot-synty-importer/
-├── synty_automator.py               # Single-file standalone CLI tool
 ├── requirements.txt
 ├── README.md
-└── addons/synty_importer/           # Standalone Godot 4 Editor Addon
+└── addons/synty_importer/           # Canonical Godot 4 Editor Addon & CLI Engine
     ├── plugin.cfg
     ├── plugin.gd
-    ├── synty_automator.py           # Self-contained automation engine
+    ├── synty_automator.py           # Self-contained universal automation engine
     └── README.md                    # Addon documentation
 ```
 
