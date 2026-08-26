@@ -13,14 +13,14 @@ Handles:
   - Universal multi-character rig hierarchy & selective mesh visibility
   - Project-wide scene & resource UID synchronization
   - World-triplanar UV & normal map import normalization
+  - Direct Unity Scene (.unity) to Godot Scene (.tscn) compilation (Overview, Demo_City, etc.)
   - Headless cache purging for seamless Godot editor reloads
 
 Usage:
-    python3 synty_automator.py [--path /path/to/godot_project] [--extract-all] [--package /path/to/pack.unitypackage] [--purge-cache]
+    python3 addons/synty_importer/synty_automator.py [--path /path/to/godot_project] [--extract-all] [--package /path/to/pack.unitypackage] [--purge-cache]
 """
 
 import argparse
-import mmap
 import os
 import re
 import struct
@@ -55,7 +55,7 @@ RE_EXT_PATH = re.compile(r'path="([^"]+)"')
 RE_EXT_UID = re.compile(r'uid="([^"]+)"')
 RE_SRC_FILE = re.compile(r'source_file="([^"]+)"')
 RE_NUM_EXT = re.compile(r"(\d+)")
-RE_RES_TEX = re.compile(r'path="res://([^"]+\.(?:png|psd|tga|jpg|jpeg|webp))"', re.IGNORECASE)
+RE_RES_TEX = re.compile(r'path="res://([^"]+\.(?:png|tga|jpg|jpeg|webp))"', re.IGNORECASE)
 RE_CLEAN_PREFIX = re.compile(r"^(?:mat_|m_|shd_|lambert_|standardsurface_|pasted__)+", re.IGNORECASE)
 RE_CLEAN_SUFFIX = re.compile(r"(?:_sg\d+|sg\d+|\.mat|\.tres)+$", re.IGNORECASE)
 
@@ -105,11 +105,39 @@ def normalize_tex_stem(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", low)
 
 
-def is_default_atlas_key(k: str) -> bool:
-    low = k.lower()
-    if any(sub in low for sub in ["hack", "branch", "glass", "damage", "alt", "skin", "poster", "wall", "floor", "brick", "junk", "trash", "gradient", "holo"]):
-        return False
-    return low.endswith("01_a") or "colormap" in low or "palette" in low or "base_color" in low or "texture_01" in low or "01_a" in low
+ATLAS_INCLUDE_KEYWORDS = ("colormap", "texture_01", "base_color", "diffuse", "palette", "atlas", "main", "01_a")
+ATLAS_EXCLUDE_TOKENS = ("dst", "hack", "branch", "glass", "damage", "alt", "skin", "poster", "wall", "floor", "brick", "junk", "trash", "gradient", "holo")
+
+
+def looks_like_atlas(name: str) -> bool:
+    low = name.lower()
+    return any(k in low for k in ATLAS_INCLUDE_KEYWORDS) and not any(t in low for t in ATLAS_EXCLUDE_TOKENS)
+
+
+def quat_to_basis(x: float, y: float, z: float, w: float, sx: float = 1.0, sy: float = 1.0, sz: float = 1.0) -> Tuple[float, ...]:
+    length = (x * x + y * y + z * z + w * w) ** 0.5
+    if length > 0.00001:
+        x, y, z, w = x / length, y / length, z / length, w / length
+    else:
+        x, y, z, w = 0.0, 0.0, 0.0, 1.0
+
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+
+    r00 = (1.0 - 2.0 * (yy + zz)) * sx
+    r01 = (2.0 * (xy - wz)) * sy
+    r02 = (2.0 * (xz + wy)) * sz
+
+    r10 = (2.0 * (xy + wz)) * sx
+    r11 = (1.0 - 2.0 * (xx + zz)) * sy
+    r12 = (2.0 * (yz - wx)) * sz
+
+    r20 = (2.0 * (xz - wy)) * sx
+    r21 = (2.0 * (yz + wx)) * sy
+    r22 = (1.0 - 2.0 * (xx + yy)) * sz
+
+    return (r00, r01, r02, r10, r11, r12, r20, r21, r22)
 
 
 # ==============================================================================
@@ -143,21 +171,27 @@ def extract_unitypackage(package_path: str, destination_root: str) -> int:
         raise FileNotFoundError(f"Package not found: {package_path}")
 
     guid_to_path, guid_to_asset = read_unitypackage_data(package_path)
-    extracted = 0
-    for guid, rel in guid_to_path.items():
+
+    def write_asset(item: Tuple[str, str]) -> int:
+        guid, rel = item
         if not rel or guid not in guid_to_asset:
-            continue
+            return 0
         target = os.path.join(destination_root, rel)
         if not os.path.realpath(target).startswith(os.path.realpath(destination_root) + os.sep):
-            fail_warn(f"Skipped unsafe path in package: {rel}")
-            continue
+            return 0
+        if os.path.exists(target):
+            return 0
         os.makedirs(os.path.dirname(target), exist_ok=True)
         try:
             with open(target, "wb") as out:
                 out.write(guid_to_asset[guid])
-            extracted += 1
+            return 1
         except Exception as exc:
             fail_warn(f"Failed to extract {rel}: {exc}")
+            return 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        extracted = sum(ex.map(write_asset, guid_to_path.items()))
     return extracted
 
 
@@ -178,8 +212,8 @@ def parse_unity_mat_yaml(raw_yaml: str, guid_to_path: Dict[str, str]) -> Dict[st
         pname, val = block.group(1), float(block.group(2))
         floats[pname] = val
 
-    is_transparent = "RenderType: Transparent" in raw_yaml or "_SURFACE_TYPE_TRANSPARENT" in raw_yaml
-    is_cutout = "RenderType: TransparentCutout" in raw_yaml or "_ALPHATEST_ON" in raw_yaml or floats.get("_AlphaClip", 0) == 1
+    is_transparent = "_SURFACE_TYPE_TRANSPARENT" in raw_yaml or "_BLENDMODE_ALPHA" in raw_yaml or "_ALPHAPREMULTIPLY_ON" in raw_yaml
+    is_cutout = "_ALPHATEST_ON" in raw_yaml
     is_holo = "Hologram" in raw_yaml or "_Neon_Color" in colors or "_Holo_Lines" in texs
 
     return {
@@ -192,28 +226,33 @@ def parse_unity_mat_yaml(raw_yaml: str, guid_to_path: Dict[str, str]) -> Dict[st
     }
 
 
-def resolve_texture_res_path(tex_rel_path: Optional[str], project_root: str, pack_dir: str) -> Optional[str]:
-    if not tex_rel_path:
+def resolve_texture_res_path(
+    tex_rel_path: Optional[str],
+    project_root: str,
+    pack_dir: str,
+    image_lookup: Optional[Dict[Tuple[str, str], str]] = None
+) -> Optional[str]:
+    if not tex_rel_path or tex_rel_path.lower().endswith(".psd"):
         return None
     clean_rel = tex_rel_path.replace("\\", "/").lstrip("/")
     full_path = os.path.join(project_root, clean_rel)
     if os.path.exists(full_path):
         return "res://" + clean_rel
-    fname = os.path.basename(clean_rel)
-    if fname:
-        for root, _, files in os.walk(pack_dir):
-            for f in files:
-                if f.lower() == fname.lower():
-                    found_rel = os.path.relpath(os.path.join(root, f), project_root).replace("\\", "/")
-                    return "res://" + found_rel
-    return "res://" + clean_rel
+    fname = os.path.basename(clean_rel).lower()
+    norm_pdir = os.path.normpath(pack_dir)
+    if image_lookup and (norm_pdir, fname) in image_lookup:
+        found_p = image_lookup[(norm_pdir, fname)]
+        return "res://" + os.path.relpath(found_p, project_root).replace("\\", "/")
+    return "res://" + clean_rel if os.path.exists(full_path) else None
 
 
 def generate_godot_material_from_unity(
     mat_stem: str,
     parsed: Dict[str, Any],
     project_root: str,
-    pack_dir: str
+    pack_dir: str,
+    default_atlas: Optional[str] = None,
+    image_lookup: Optional[Dict[Tuple[str, str], str]] = None
 ) -> str:
     texs = parsed["texs"]
     colors = parsed["colors"]
@@ -225,15 +264,28 @@ def generate_godot_material_from_unity(
     ext_resources = []
     properties = []
     res_idx = 1
+    norm_pdir = os.path.normpath(pack_dir)
 
     # 1. Albedo Texture & Color
     albedo_res_id = None
-    albedo_tex_path = texs.get("_Albedo_Map") or texs.get("_MainTex") or texs.get("_BaseMap")
+    albedo_tex_path = (
+        texs.get("_Albedo_Map") or texs.get("_MainTex") or texs.get("_BaseMap") or
+        texs.get("_ColorMap") or texs.get("_BaseColorMap") or texs.get("_Main_Tex") or
+        texs.get("_Wall_Texture")
+    )
     if not albedo_tex_path and is_holo:
         albedo_tex_path = texs.get("_Holo_Lines")
 
+    if not albedo_tex_path and image_lookup:
+        mat_clean = normalize_tex_stem(mat_stem.lower())
+        matched_img = image_lookup.get((norm_pdir, mat_clean)) or image_lookup.get((norm_pdir, mat_stem.lower()))
+        if matched_img:
+            albedo_tex_path = os.path.relpath(matched_img, project_root).replace("\\", "/")
+        elif default_atlas and not any(k in mat_stem.lower() for k in ["glass", "transparent", "blank", "skybox", "laser"]):
+            albedo_tex_path = os.path.relpath(default_atlas, project_root).replace("\\", "/")
+
     if albedo_tex_path:
-        rel_albedo = resolve_texture_res_path(albedo_tex_path, project_root, pack_dir)
+        rel_albedo = resolve_texture_res_path(albedo_tex_path, project_root, pack_dir, image_lookup)
         if rel_albedo:
             albedo_res_id = f"{res_idx}_tex"
             ext_resources.append(f'[ext_resource type="Texture2D" path="{rel_albedo}" id="{albedo_res_id}"]')
@@ -245,27 +297,25 @@ def generate_godot_material_from_unity(
         properties.append(f'albedo_color = Color({base_col[0]:.6g}, {base_col[1]:.6g}, {base_col[2]:.6g}, {base_col[3]:.6g})')
 
     # 2. Transparency, Cull, and Shading
-    if is_cutout:
+    mat_low = mat_stem.lower()
+    is_glass = "glass" in mat_low or "transparent" in mat_low or "water" in mat_low
+    is_cutout_name = any(k in mat_low for k in ["junk", "trash", "fence", "chain", "leaves", "foliage", "plant", "decal", "graffiti", "wire", "grid", "cutout"])
+
+    if is_glass or is_holo or is_transparent:
+        properties.append("transparency = 1")
+    elif is_cutout_name:
         properties.append("transparency = 2")
         properties.append(f'alpha_scissor_threshold = {floats.get("_Cutoff", 0.5):.6g}')
-    elif is_transparent or is_holo:
-        properties.append("transparency = 1")
 
-    cull_val = floats.get("_Cull", 2)
-    if is_holo or cull_val == 0:
-        properties.append("cull_mode = 2")
-    elif cull_val == 1:
-        properties.append("cull_mode = 1")
-    else:
-        properties.append("cull_mode = 0")
+    properties.append("cull_mode = 2")
 
     if is_holo:
         properties.append("shading_mode = 0")
 
     # 3. Normal Map
-    norm_path = texs.get("_Normal_Map") or texs.get("_BumpMap")
-    if norm_path:
-        rel_norm = resolve_texture_res_path(norm_path, project_root, pack_dir)
+    norm_path = texs.get("_Normal_Map") or texs.get("_BumpMap") or texs.get("_Normals_Map")
+    if norm_path and not any(k in mat_low for k in ["hologram", "glass", "fx_"]):
+        rel_norm = resolve_texture_res_path(norm_path, project_root, pack_dir, image_lookup)
         if rel_norm:
             ext_resources.append(f'[ext_resource type="Texture2D" path="{rel_norm}" id="{res_idx}_normal"]')
             properties.append("normal_enabled = true")
@@ -273,9 +323,9 @@ def generate_godot_material_from_unity(
             res_idx += 1
 
     # 4. Occlusion (AO)
-    ao_path = texs.get("_OcclusionMap") or texs.get("_AO_Map")
+    ao_path = texs.get("_OcclusionMap") or texs.get("_AO_Map") or texs.get("_AOMap")
     if ao_path:
-        rel_ao = resolve_texture_res_path(ao_path, project_root, pack_dir)
+        rel_ao = resolve_texture_res_path(ao_path, project_root, pack_dir, image_lookup)
         if rel_ao:
             ext_resources.append(f'[ext_resource type="Texture2D" path="{rel_ao}" id="{res_idx}_ao"]')
             properties.append("ao_enabled = true")
@@ -283,26 +333,31 @@ def generate_godot_material_from_unity(
             res_idx += 1
 
     # 5. Emission
-    emissive_tex_path = texs.get("_Emission_Mask") or texs.get("_Emission_Map") or texs.get("_EmissionMap")
+    is_neon_mat = any(k in mat_low for k in ["hologram", "holo", "neon", "laser", "glow", "light", "emissive", "screen", "monitor", "billboard", "sign", "lamp", "vending"])
+    emissive_tex_path = (
+        texs.get("_Emission_Mask") or texs.get("_Emission_Map") or
+        texs.get("_EmissionMap")
+    )
     neon_col = colors.get("_Neon_Color") or colors.get("_Neon_Colour_01")
-    em_col = colors.get("_EmissionColor") or colors.get("_Emission_Color")
 
-    has_emission = bool(emissive_tex_path or (neon_col and max(neon_col[:3]) > 0.01) or (em_col and max(em_col[:3]) > 0.01))
-    if has_emission or is_holo:
+    if emissive_tex_path and is_neon_mat:
+        rel_em = resolve_texture_res_path(emissive_tex_path, project_root, pack_dir, image_lookup)
+        if rel_em:
+            properties.append("emission_enabled = true")
+            em_col = neon_col or colors.get("_EmissionColor") or colors.get("_Emission_Color") or (1.0, 1.0, 1.0, 1.0)
+            properties.append(f'emission = Color({em_col[0]:.6g}, {em_col[1]:.6g}, {em_col[2]:.6g}, 1)')
+            em_power = floats.get("_Emission_Power", floats.get("_EmissionStrength", 1.0))
+            properties.append(f'emission_energy_multiplier = {em_power:.6g}')
+            ext_resources.append(f'[ext_resource type="Texture2D" path="{rel_em}" id="{res_idx}_emission"]')
+            properties.append(f'emission_texture = ExtResource("{res_idx}_emission")')
+            res_idx += 1
+    elif is_holo or (is_neon_mat and neon_col):
         properties.append("emission_enabled = true")
-        final_em_col = neon_col or em_col or (1.0, 1.0, 1.0, 1.0)
+        final_em_col = neon_col or (0.2, 0.8, 1.0, 1.0)
         properties.append(f'emission = Color({final_em_col[0]:.6g}, {final_em_col[1]:.6g}, {final_em_col[2]:.6g}, 1)')
         em_power = floats.get("_Emission_Power", floats.get("_EmissionStrength", 2.0))
-        if is_holo and em_power < 1.0:
-            em_power = 2.0
         properties.append(f'emission_energy_multiplier = {em_power:.6g}')
-        if emissive_tex_path:
-            rel_em = resolve_texture_res_path(emissive_tex_path, project_root, pack_dir)
-            if rel_em:
-                ext_resources.append(f'[ext_resource type="Texture2D" path="{rel_em}" id="{res_idx}_emission"]')
-                properties.append(f'emission_texture = ExtResource("{res_idx}_emission")')
-                res_idx += 1
-        elif albedo_res_id and is_holo:
+        if albedo_res_id and is_holo:
             properties.append(f'emission_texture = ExtResource("{albedo_res_id}")')
 
     # 6. Roughness & Metallic
@@ -342,6 +397,7 @@ def collect_project_files(project_root: str) -> Dict[str, List[str]]:
         "imports": [],
         "tscn": [],
         "unitypackages": [],
+        "unityscenes": [],
     }
     for root, dirs, files in os.walk(project_root):
         dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
@@ -358,12 +414,16 @@ def collect_project_files(project_root: str) -> Dict[str, List[str]]:
                 categories["imports"].append(full_path)
             elif low.endswith(".tscn"):
                 categories["tscn"].append(full_path)
-            elif low.endswith(".unitypackage"):
+            elif low.endswith(".unitypackage") and "/addons/" not in full_path.replace("\\", "/") and "/test/" not in full_path.replace("\\", "/"):
                 categories["unitypackages"].append(full_path)
+            elif low.endswith(".unity") and "/test/" not in full_path.replace("\\", "/"):
+                categories["unityscenes"].append(full_path)
     return categories
 
 
 def save_image_safe(img: Optional[Any], target_path: str) -> None:
+    if target_path.lower().endswith(".psd"):
+        return
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     ext = os.path.splitext(target_path)[1].lower()
 
@@ -395,8 +455,9 @@ def sanitize_and_resolve_textures(project_root: str, categorized_files: Dict[str
     for p in categorized_files.get("images", []):
         low = os.path.basename(p).lower()
         pack_dir = get_pack_root(p)
-        is_atlas = any(k in low for k in ["colormap", "texture_01", "base_color", "diffuse", "palette", "atlas", "main"]) and "dst" not in low and not any(sub in low for sub in ["hack", "branch", "glass"])
-        if is_atlas:
+        if os.path.normpath(pack_dir) == os.path.normpath(project_root):
+            continue
+        if looks_like_atlas(low):
             pack_atlases.setdefault(pack_dir, p)
             all_atlases.append(p)
 
@@ -432,7 +493,8 @@ def sanitize_and_resolve_textures(project_root: str, categorized_files: Dict[str
             with open(p, "r", encoding="utf-8", errors="ignore") as fh:
                 txt = fh.read()
             for rel in RE_RES_TEX.findall(txt):
-                referenced_textures.add(rel)
+                if not rel.lower().endswith(".psd"):
+                    referenced_textures.add(rel)
         except Exception:
             pass
 
@@ -441,6 +503,8 @@ def sanitize_and_resolve_textures(project_root: str, categorized_files: Dict[str
         list(ex.map(scan_tex_refs, scan_targets))
 
     for rel in referenced_textures:
+        if rel.lower().endswith(".psd") or "/" not in rel.replace("res://", "", 1):
+            continue
         full_target = os.path.join(project_root, rel)
         if not os.path.exists(full_target):
             pack_dir = get_pack_root(full_target)
@@ -455,42 +519,7 @@ def sanitize_and_resolve_textures(project_root: str, categorized_files: Dict[str
             except Exception:
                 pass
 
-    # 3. FBX Embedded Texture Dependencies
-    for fbx_p in categorized_files.get("fbx", []):
-        fbx_d = os.path.dirname(fbx_p)
-        g = parse_fbx_graph(fbx_p)
-        needed_files = set()
-        for vid in g.get("videos", {}).values():
-            if vid:
-                needed_files.add(os.path.basename(vid.replace("\\", "/")))
-        for tex_name, fname in g.get("textures", {}).values():
-            if fname:
-                needed_files.add(os.path.basename(fname.replace("\\", "/")))
-
-        for req in needed_files:
-            if not req:
-                continue
-            fbx_target = os.path.join(fbx_d, req)
-            if not os.path.exists(fbx_target):
-                pack_dir = get_pack_root(fbx_target)
-                req_stem = os.path.splitext(req)[0].lower()
-                matched_tex = None
-                for t_candidate in categorized_files.get("images", []):
-                    if get_pack_root(t_candidate) == pack_dir and os.path.splitext(os.path.basename(t_candidate))[0].lower() == req_stem:
-                        matched_tex = t_candidate
-                        break
-                src_atlas = matched_tex or pack_atlases.get(pack_dir) or global_default_atlas
-                try:
-                    if HAS_PIL and src_atlas and os.path.exists(src_atlas):
-                        with Image.open(src_atlas) as img:
-                            save_image_safe(img, fbx_target)
-                    else:
-                        save_image_safe(None, fbx_target)
-                    aliases_created += 1
-                except Exception:
-                    pass
-
-    # 4. Texture .import normalizer
+    # 3. Texture .import normalizer
     def check_texture_import(p: str) -> int:
         if "normal" in p.lower():
             return 0
@@ -606,6 +635,7 @@ def parse_fbx_graph(file_path: str) -> Dict[str, Any]:
     materials: Dict[int, str] = {}
     textures: Dict[int, Tuple[str, str]] = {}
     videos: Dict[int, str] = {}
+    has_skin = False
     if objects:
         for c in objects[2]:
             c_name, c_props, c_children = c
@@ -613,6 +643,8 @@ def parse_fbx_graph(file_path: str) -> Dict[str, Any]:
                 mat_id = c_props[0]
                 mat_name = str(c_props[1]).split(chr(0))[0].split("::")[-1]
                 materials[mat_id] = mat_name
+            elif c_name == "Deformer" and len(c_props) >= 3 and c_props[2] == "Skin":
+                has_skin = True
             elif c_name == "Texture" and len(c_props) >= 2:
                 tex_id = c_props[0]
                 tex_name = str(c_props[1]).split(chr(0))[0].split("::")[-1]
@@ -652,7 +684,8 @@ def parse_fbx_graph(file_path: str) -> Dict[str, Any]:
         "materials": materials,
         "textures": textures,
         "videos": videos,
-        "mat_to_textures": slot_to_tex
+        "mat_to_textures": slot_to_tex,
+        "has_skin": has_skin
     }
 
 
@@ -671,8 +704,33 @@ def synchronize_unitypackage_materials(
         pack_dict = pack_prefab_mats.setdefault(norm_pack, {})
         existing = pack_dict.setdefault(model_key, [])
         for m in mats:
-            if m not in existing:
-                existing.append(m)
+            clean_m = m if m.endswith(".tres") else m + ".tres"
+            if clean_m not in existing:
+                existing.append(clean_m)
+
+    # Build global guid_to_path from all packages
+    global_guid_to_path: Dict[str, str] = {}
+    for pkg in categorized_files.get("unitypackages", []):
+        pkg_guids, _ = read_unitypackage_data(pkg)
+        global_guid_to_path.update(pkg_guids)
+
+    # Build pack_atlases and pack_images_by_stem
+    pack_atlases: Dict[str, str] = {}
+    all_atlases: List[str] = []
+    pack_images_by_stem: Dict[Tuple[str, str], str] = {}
+    for p in categorized_files.get("images", []):
+        low = os.path.basename(p).lower()
+        p_dir = os.path.normpath(get_pack_root(p))
+        if p_dir == os.path.normpath(project_root):
+            continue
+        stem = os.path.splitext(low)[0]
+        norm_stem = normalize_tex_stem(stem)
+        pack_images_by_stem[(p_dir, stem)] = p
+        pack_images_by_stem[(p_dir, norm_stem)] = p
+        if looks_like_atlas(low):
+            pack_atlases.setdefault(p_dir, p)
+            all_atlases.append(p)
+    global_default_atlas = next(iter(pack_atlases.values()), all_atlases[0] if all_atlases else None)
 
     # 1. Parse Unity Packages
     for pkg in categorized_files.get("unitypackages", []):
@@ -684,10 +742,10 @@ def synchronize_unitypackage_materials(
         for guid, rel_path in guid_to_path.items():
             if rel_path.endswith(".mat") and guid in guid_to_asset:
                 raw_yaml = guid_to_asset[guid].decode("utf-8", errors="ignore")
-                parsed = parse_unity_mat_yaml(raw_yaml, guid_to_path)
+                parsed = parse_unity_mat_yaml(raw_yaml, global_guid_to_path)
                 mat_stem = os.path.splitext(os.path.basename(rel_path))[0]
                 pack_dir = get_pack_root(os.path.normpath(os.path.join(project_root, rel_path)))
-                
+
                 target_mat = os.path.join(project_root, rel_path + ".tres")
                 if not os.path.exists(os.path.join(project_root, rel_path)):
                     rel_clean = rel_path.replace("\\", "/").lstrip("/")
@@ -704,7 +762,8 @@ def synchronize_unitypackage_materials(
                 res_p = "res://" + os.path.relpath(target_mat, project_root).replace("\\", "/")
                 mat_guid_to_res[guid] = res_p
 
-                mat_content = generate_godot_material_from_unity(mat_stem, parsed, project_root, pack_dir)
+                atlas_fallback = pack_atlases.get(pack_dir) or global_default_atlas
+                mat_content = generate_godot_material_from_unity(mat_stem, parsed, project_root, pack_dir, default_atlas=atlas_fallback, image_lookup=pack_images_by_stem)
                 os.makedirs(os.path.dirname(target_mat), exist_ok=True)
                 try:
                     with open(target_mat, "w", encoding="utf-8") as out:
@@ -718,7 +777,7 @@ def synchronize_unitypackage_materials(
             elif rel_path.endswith(".prefab") and guid in guid_to_asset:
                 raw_yaml = guid_to_asset[guid].decode("utf-8", errors="ignore")
                 pack_dir = get_pack_root(os.path.normpath(os.path.join(project_root, rel_path)))
-                
+
                 mat_paths = []
                 for block in re.finditer(r"m_Materials:\s*\n((?:\s*-\s*\{fileID:[^\}]+\}\s*\n?)+)", raw_yaml):
                     for mg in re.findall(r"guid:\s*([a-f0-9]{32})", block.group(1)):
@@ -728,7 +787,8 @@ def synchronize_unitypackage_materials(
                             if mp and mp.endswith(".mat"):
                                 res_p = "res://" + mp.replace("\\", "/") + ".tres"
                         if res_p:
-                            mat_paths.append(res_p)
+                            clean_p = res_p if res_p.endswith(".tres") else res_p + ".tres"
+                            mat_paths.append(clean_p)
 
                 for block in re.finditer(r"propertyPath:\s*m_Materials\.Array\.data\[(\d+)\]\s*\n\s*value:\s*\n\s*objectReference:\s*\{fileID:[^,]+,\s*guid:\s*([a-f0-9]{32})", raw_yaml):
                     idx, mg = int(block.group(1)), block.group(2)
@@ -738,9 +798,10 @@ def synchronize_unitypackage_materials(
                         if mp and mp.endswith(".mat"):
                             res_p = "res://" + mp.replace("\\", "/") + ".tres"
                     if res_p:
+                        clean_p = res_p if res_p.endswith(".tres") else res_p + ".tres"
                         while len(mat_paths) <= idx:
-                            mat_paths.append(res_p)
-                        mat_paths[idx] = res_p
+                            mat_paths.append(clean_p)
+                        mat_paths[idx] = clean_p
 
                 if mat_paths:
                     mesh_guids = re.findall(r"m_Mesh:\s*\{fileID:[^,]+,\s*guid:\s*([a-f0-9]{32})", raw_yaml)
@@ -761,8 +822,9 @@ def synchronize_unitypackage_materials(
             try:
                 with open(mpath, "r", encoding="utf-8", errors="ignore") as fh:
                     raw_yaml = fh.read()
-                parsed = parse_unity_mat_yaml(raw_yaml, {})
-                mat_content = generate_godot_material_from_unity(mat_stem, parsed, project_root, pack_dir)
+                parsed = parse_unity_mat_yaml(raw_yaml, global_guid_to_path)
+                atlas_fallback = pack_atlases.get(pack_dir) or global_default_atlas
+                mat_content = generate_godot_material_from_unity(mat_stem, parsed, project_root, pack_dir, default_atlas=atlas_fallback, image_lookup=pack_images_by_stem)
                 os.makedirs(os.path.dirname(target_mat), exist_ok=True)
                 with open(target_mat, "w", encoding="utf-8") as out:
                     out.write(mat_content)
@@ -789,7 +851,7 @@ def synchronize_unitypackage_materials(
                 mesh_matches = re.findall(r'path="res://[^"]*?/([a-zA-Z0-9_-]+)\.(?:mesh|fbx)"', txt)
                 p_stem = os.path.basename(p).replace(".prefab.tscn", "").lower()
                 if ext_mats:
-                    m_list = list(ext_mats.values())
+                    m_list = [m if m.endswith(".tres") else m + ".tres" for m in ext_mats.values()]
                     add_prefab_mats(pack_dir, p_stem, m_list)
                     for msh in mesh_matches:
                         add_prefab_mats(pack_dir, msh.lower(), m_list)
@@ -827,44 +889,53 @@ def resolve_slot_material(
     prefab_mats: Optional[List[str]] = None,
     slot_index: int = 0
 ) -> str:
+    res = ""
     if prefab_mats and len(prefab_mats) > 0:
         if slot_index < len(prefab_mats):
-            return prefab_mats[slot_index]
-        return prefab_mats[0]
+            res = prefab_mats[slot_index]
+        else:
+            res = prefab_mats[0]
+    else:
+        skip_sfx = ("_normal", "_normals", "_n", "_emissive", "_emission", "emissive", "emission", "_occlusion", "_ao", "_mask", "_alpha")
+        diffuse_candidates = [t for t in connected_tex if not any(sfx in os.path.basename(t).lower() for sfx in skip_sfx)]
+        search_order = diffuse_candidates if diffuse_candidates else connected_tex
 
-    skip_sfx = ("_normal", "_normals", "_n", "_emissive", "_emission", "emissive", "emission", "_occlusion", "_ao", "_mask", "_alpha")
-    diffuse_candidates = [t for t in connected_tex if not any(sfx in os.path.basename(t).lower() for sfx in skip_sfx)]
-    search_order = diffuse_candidates if diffuse_candidates else connected_tex
+        for tex in search_order:
+            low = os.path.basename(tex).lower()
+            stem = normalize_tex_stem(low)
+            if stem in tex_to_mat:
+                res = tex_to_mat[stem]
+                break
 
-    for tex in search_order:
-        low = os.path.basename(tex).lower()
-        stem = normalize_tex_stem(low)
-        if stem in tex_to_mat:
-            return tex_to_mat[stem]
+        if not res:
+            s_low = slot.lower()
+            if s_low in mats:
+                res = mats[s_low]
+            else:
+                norm_slot = RE_CLEAN_PREFIX.sub("", s_low)
+                norm_slot = RE_CLEAN_SUFFIX.sub("", norm_slot)
+                if norm_slot in mats:
+                    res = mats[norm_slot]
+                elif normalize_tex_stem(norm_slot) in tex_to_mat:
+                    res = tex_to_mat[normalize_tex_stem(norm_slot)]
+                elif normalize_tex_stem(norm_slot) in mats:
+                    res = mats[normalize_tex_stem(norm_slot)]
+                elif any(term in s_low for term in ["wall", "brick", "building"]):
+                    num_m = RE_NUM_EXT.search(slot)
+                    if num_m:
+                        target_key = f"wall_{num_m.group(1).zfill(2)}"
+                        for k in [f"{target_key}_a", f"{target_key}_b", target_key]:
+                            if k in mats:
+                                res = mats[k]
+                                break
 
-    s_low = slot.lower()
-    if s_low in mats:
-        return mats[s_low]
+    if not res:
+        res = default_atlas
 
-    norm_slot = RE_CLEAN_PREFIX.sub("", s_low)
-    norm_slot = RE_CLEAN_SUFFIX.sub("", norm_slot)
-    if norm_slot in mats:
-        return mats[norm_slot]
-    norm_stem = normalize_tex_stem(norm_slot)
-    if norm_stem in tex_to_mat:
-        return tex_to_mat[norm_stem]
-    if norm_stem in mats:
-        return mats[norm_stem]
+    if res and res.endswith(".mat"):
+        res += ".tres"
 
-    if any(term in s_low for term in ["wall", "brick", "building"]):
-        num_m = RE_NUM_EXT.search(slot)
-        if num_m:
-            target_key = f"wall_{num_m.group(1).zfill(2)}"
-            for k in [f"{target_key}_a", f"{target_key}_b", target_key]:
-                if k in mats:
-                    return mats[k]
-
-    return default_atlas
+    return res
 
 
 def map_all_fbx_materials(
@@ -878,9 +949,10 @@ def map_all_fbx_materials(
     global_tex_to_mat: Dict[str, str] = {}
 
     for p in categorized_files.get("materials", []):
-        stem = os.path.basename(p).replace(".mat.tres", "").replace(".tres", "").lower()
+        target_p = p + ".tres" if p.endswith(".mat") else p
+        stem = os.path.basename(p).replace(".mat.tres", "").replace(".tres", "").replace(".mat", "").lower()
         norm_mat_stem = normalize_tex_stem(stem)
-        rel = "res://" + os.path.relpath(p, project_root).replace("\\", "/")
+        rel = "res://" + os.path.relpath(target_p, project_root).replace("\\", "/")
         pack_dir = os.path.normpath(get_pack_root(p))
 
         p_mats = pack_materials.setdefault(pack_dir, {})
@@ -903,6 +975,8 @@ def map_all_fbx_materials(
         p_mats = pack_materials.get(pack_dir, {})
         mat_path = p_mats.get(stem) or p_mats.get(norm_stem) or all_materials.get(stem) or all_materials.get(norm_stem)
         if mat_path:
+            if mat_path.endswith(".mat"):
+                mat_path += ".tres"
             pack_tex_to_mat.setdefault(pack_dir, {})[stem] = mat_path
             pack_tex_to_mat.setdefault(pack_dir, {})[norm_stem] = mat_path
             global_tex_to_mat[stem] = mat_path
@@ -917,7 +991,7 @@ def map_all_fbx_materials(
 
         p_mats = pack_materials.get(pack_dir, all_materials)
         p_tex = pack_tex_to_mat.get(pack_dir, global_tex_to_mat)
-        
+
         pref_mats = pack_prefab_mats.get(pack_dir, {}).get(model_stem)
         if not pref_mats:
             for p_key, p_dict in pack_prefab_mats.items():
@@ -927,7 +1001,7 @@ def map_all_fbx_materials(
 
         default_atlas = ""
         for k, v in p_mats.items():
-            if is_default_atlas_key(k):
+            if looks_like_atlas(k):
                 default_atlas = v
                 break
         if not default_atlas:
@@ -937,6 +1011,7 @@ def map_all_fbx_materials(
         if os.path.exists(imp_path):
             with open(imp_path, "r", encoding="utf-8", errors="ignore") as fh:
                 content = fh.read()
+            content = re.sub(r'("use_external/path":\s*"res://[^"]+?\.mat)"', r'\1.tres"', content)
         else:
             rel_source = "res://" + os.path.relpath(fbx_path, project_root).replace("\\", "/")
             base_f = os.path.basename(fbx_path)
@@ -1008,15 +1083,37 @@ fbx/naming_version=1
                     "use_external/path": res_mat
                 }
 
+        nodes_match = re.search(r'("nodes":\s*\{[\s\S]*?\n\s*\})', content)
+        nodes_block = nodes_match.group(1) if nodes_match else None
+        meshes_match = re.search(r'("meshes":\s*\{[\s\S]*?\n\s*\})', content)
+        meshes_block = meshes_match.group(1) if meshes_match else None
+        skins_match = re.search(r'("skins":\s*\{[\s\S]*?\n\s*\})', content)
+        skins_block = skins_match.group(1) if skins_match else None
+
+        if not meshes_block and g.get("has_skin"):
+            fbx_base = os.path.splitext(os.path.basename(fbx_path))[0]
+            ext_dir = os.path.join(os.path.dirname(fbx_path), "extracted")
+            os.makedirs(ext_dir, exist_ok=True)
+            rel_ext_dir = "res://" + os.path.relpath(ext_dir, project_root).replace("\\", "/")
+            meshes_block = f'"meshes": {{\n"PATH:{fbx_base}": {{\n"save_to_file/enabled": true,\n"save_to_file/path": "{rel_ext_dir}/{fbx_base}.{fbx_base}.mesh"\n}}\n}}'
+            skins_block = f'"skins": {{\n"PATH:{fbx_base}": {{\n"save_to_file/enabled": true,\n"save_to_file/path": "{rel_ext_dir}/{fbx_base}.{fbx_base}.skin.tres"\n}}\n}}'
+
         sub_json_lines = ['_subresources={\n"materials": {']
         for i, (k, v) in enumerate(mat_dict.items()):
             comma = "," if i < len(mat_dict) - 1 else ""
             sub_json_lines.append(f'"{k}": {{\n"use_external/enabled": true,\n"use_external/path": "{v["use_external/path"]}"\n}}{comma}')
-        sub_json_lines.append("}\n}")
+        sub_json_lines.append("}")
+        if nodes_block:
+            sub_json_lines.append(",\n" + nodes_block)
+        if meshes_block:
+            sub_json_lines.append(",\n" + meshes_block)
+        if skins_block:
+            sub_json_lines.append(",\n" + skins_block)
+        sub_json_lines.append("\n}")
         new_sub = "\n".join(sub_json_lines)
 
         if "_subresources={" in content:
-            content = re.sub(r"_subresources=\{[\s\S]*?\n\}", new_sub, content)
+            content = re.sub(r"_subresources=\{[\s\S]*?(?=\n(?:fbx/|\[|$))", new_sub, content)
         else:
             content += "\n" + new_sub + "\n"
 
@@ -1157,6 +1254,424 @@ def synchronize_uids(project_root: str, categorized_files: Dict[str, List[str]])
 
 
 # ==============================================================================
+# 7. Unity Scene (.unity -> .tscn) Compilation Engine
+# ==============================================================================
+def quat_mult(q1: Tuple[float, float, float, float], q2: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    return (
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    )
+
+
+def quat_rot_vec(q: Tuple[float, float, float, float], v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    x, y, z, w = q
+    vx, vy, vz = v
+    cx = y * vz - z * vy
+    cy = z * vx - x * vz
+    cz = x * vy - y * vx
+    cx2 = cx + w * vx
+    cy2 = cy + w * vy
+    cz2 = cz + w * vz
+    return (vx + 2.0 * (y * cz2 - z * cy2), vy + 2.0 * (z * cx2 - x * cz2), vz + 2.0 * (x * cy2 - y * cx2))
+
+
+def combine_transforms(
+    p_pos: Tuple[float, float, float],
+    p_rot: Tuple[float, float, float, float],
+    p_scale: Tuple[float, float, float],
+    c_pos: Tuple[float, float, float],
+    c_rot: Tuple[float, float, float, float],
+    c_scale: Tuple[float, float, float]
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float, float], Tuple[float, float, float]]:
+    scaled_pos = (c_pos[0] * p_scale[0], c_pos[1] * p_scale[1], c_pos[2] * p_scale[2])
+    rot_pos = quat_rot_vec(p_rot, scaled_pos)
+    w_pos = (p_pos[0] + rot_pos[0], p_pos[1] + rot_pos[1], p_pos[2] + rot_pos[2])
+    w_rot = quat_mult(p_rot, c_rot)
+    w_scale = (p_scale[0] * c_scale[0], p_scale[1] * c_scale[1], p_scale[2] * c_scale[2])
+    return w_pos, w_rot, w_scale
+
+
+def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[str]]) -> int:
+    unity_scenes = categorized_files.get("unityscenes", [])
+    if not unity_scenes:
+        return 0
+
+    # 1. Map guid to path from packages
+    guid_to_path: Dict[str, str] = {}
+    for pkg in categorized_files.get("unitypackages", []):
+        pkg_guids, _ = read_unitypackage_data(pkg)
+        guid_to_path.update(pkg_guids)
+
+    # 2. Map FBX stem to res:// path (per-pack first, then global fallback)
+    fbx_by_stem: Dict[str, str] = {}
+    fbx_by_pack_stem: Dict[Tuple[str, str], str] = {}
+    for p in categorized_files.get("fbx", []):
+        stem = os.path.splitext(os.path.basename(p))[0].lower()
+        rel = "res://" + os.path.relpath(p, project_root).replace("\\", "/")
+        fbx_by_stem[stem] = rel
+        pack_key = os.path.basename(os.path.normpath(get_pack_root(p)).rstrip("\\/")).lower()
+        fbx_by_pack_stem[(pack_key, stem)] = rel
+
+    def resolve_model_res(prefab_rel_path: str) -> Optional[str]:
+        stem = os.path.splitext(os.path.basename(prefab_rel_path))[0].lower()
+        if stem == "sm_prop_firdge_01":
+            stem = "sm_prop_fridge_01"
+        norm_pdir = os.path.normpath(get_pack_root(os.path.join(project_root, prefab_rel_path)))
+        pack_key = os.path.basename(norm_pdir.rstrip("\\/")).lower()
+        return fbx_by_pack_stem.get((pack_key, stem)) or fbx_by_stem.get(stem)
+
+    compiled = 0
+
+    for uscene in unity_scenes:
+        out_tscn = os.path.splitext(uscene)[0] + ".tscn"
+        try:
+            with open(uscene, "r", encoding="utf-8", errors="ignore") as fh:
+                raw = fh.read()
+
+            # Parse all scene Transforms (per-block: Unity YAML field order varies)
+            transforms: Dict[str, Dict[str, Any]] = {}
+            for bm in re.finditer(r"--- !u!4 &(\d+)\s*\nTransform:\s*\n(.*?)(?=--- !u!|\Z)", raw, re.S):
+                fid = bm.group(1)
+                tb = bm.group(2)
+                go_m = re.search(r"m_GameObject:\s*\{fileID:\s*(\d+)\}", tb)
+                pos_m = re.search(r"m_LocalPosition:\s*\{x:\s*([-\d.eE]+),\s*y:\s*([-\d.eE]+),\s*z:\s*([-\d.eE]+)\}", tb)
+                rot_m = re.search(r"m_LocalRotation:\s*\{x:\s*([-\d.eE]+),\s*y:\s*([-\d.eE]+),\s*z:\s*([-\d.eE]+),\s*w:\s*([-\d.eE]+)\}", tb)
+                scale_m = re.search(r"m_LocalScale:\s*\{x:\s*([-\d.eE]+),\s*y:\s*([-\d.eE]+),\s*z:\s*([-\d.eE]+)\}", tb)
+                father_m = re.search(r"m_Father:\s*\{fileID:\s*(\d+)\}", tb)
+                if not (go_m and pos_m and rot_m and scale_m):
+                    continue
+                transforms[fid] = {
+                    "goid": go_m.group(1),
+                    "pos": (float(pos_m.group(1)), float(pos_m.group(2)), float(pos_m.group(3))),
+                    "rot": (float(rot_m.group(1)), float(rot_m.group(2)), float(rot_m.group(3)), float(rot_m.group(4))),
+                    "scale": (float(scale_m.group(1)), float(scale_m.group(2)), float(scale_m.group(3))),
+                    "father": father_m.group(1) if father_m else "0",
+                }
+
+            def get_world_transform(tf_id: str, visited: Optional[Set[str]] = None) -> Tuple[Tuple[float, float, float], Tuple[float, float, float, float], Tuple[float, float, float]]:
+                if visited is None:
+                    visited = set()
+                if tf_id not in transforms or tf_id == "0" or tf_id in visited:
+                    return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0)
+                visited.add(tf_id)
+                t = transforms[tf_id]
+                if t["father"] == "0" or t["father"] == tf_id or t["father"] not in transforms:
+                    return t["pos"], t["rot"], t["scale"]
+                p_pos, p_rot, p_scale = get_world_transform(t["father"], visited)
+                return combine_transforms(p_pos, p_rot, p_scale, t["pos"], t["rot"], t["scale"])
+
+            blocks = raw.split("--- !u!1001 &")
+            if len(blocks) <= 1:
+                continue
+
+            scene_name = os.path.splitext(os.path.basename(uscene))[0]
+            ext_resources: Dict[str, str] = {}
+            nodes_data = []
+
+            for idx, b in enumerate(blocks[1:]):
+                guid_m = re.search(r"guid:\s*([a-f0-9]{32})", b)
+                if not guid_m:
+                    continue
+                guid = guid_m.group(1)
+                prefab_path = guid_to_path.get(guid, "")
+                stem = os.path.splitext(os.path.basename(prefab_path))[0].lower()
+                fbx_res = resolve_model_res(prefab_path)
+                if not fbx_res:
+                    continue
+
+                if fbx_res not in ext_resources:
+                    ext_resources[fbx_res] = f"{len(ext_resources) + 1}_{stem}"
+                res_id = ext_resources[fbx_res]
+
+                parent_m = re.search(r"m_TransformParent:\s*\{fileID:\s*(\d+)", b)
+                p_tf_id = parent_m.group(1) if parent_m else "0"
+
+                pos = {"x": 0.0, "y": 0.0, "z": 0.0}
+                rot = {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}
+                scale = {"x": 1.0, "y": 1.0, "z": 1.0}
+
+                lines = b.splitlines()
+                for i, line in enumerate(lines):
+                    if "propertyPath: m_LocalPosition." in line:
+                        axis = line.strip()[-1]
+                        for off in (1, 2):
+                            if i + off < len(lines) and "value:" in lines[i + off]:
+                                try:
+                                    pos[axis] = float(lines[i + off].split(":")[-1])
+                                except ValueError:
+                                    pass
+                                break
+                    elif "propertyPath: m_LocalRotation." in line:
+                        axis = line.strip()[-1]
+                        for off in (1, 2):
+                            if i + off < len(lines) and "value:" in lines[i + off]:
+                                try:
+                                    rot[axis] = float(lines[i + off].split(":")[-1])
+                                except ValueError:
+                                    pass
+                                break
+                    elif "propertyPath: m_LocalScale." in line:
+                        axis = line.strip()[-1]
+                        for off in (1, 2):
+                            if i + off < len(lines) and "value:" in lines[i + off]:
+                                try:
+                                    scale[axis] = float(lines[i + off].split(":")[-1])
+                                except ValueError:
+                                    pass
+                                break
+
+                if p_tf_id != "0" and p_tf_id in transforms:
+                    p_pos, p_rot, p_scale = get_world_transform(p_tf_id)
+                    w_pos, w_rot, w_scale = combine_transforms(
+                        p_pos, p_rot, p_scale,
+                        (pos["x"], pos["y"], pos["z"]),
+                        (rot["x"], rot["y"], rot["z"], rot["w"]),
+                        (scale["x"], scale["y"], scale["z"])
+                    )
+                else:
+                    w_pos = (pos["x"], pos["y"], pos["z"])
+                    w_rot = (rot["x"], rot["y"], rot["z"], rot["w"])
+                    w_scale = (scale["x"], scale["y"], scale["z"])
+
+                gx = w_pos[0]
+                gy = w_pos[1]
+                gz = -w_pos[2]
+
+                qx = w_rot[0]
+                qy = w_rot[1]
+                qz = -w_rot[2]
+                qw = -w_rot[3]
+
+                basis = quat_to_basis(qx, qy, qz, qw, w_scale[0], w_scale[1], w_scale[2])
+                t_str = f"Transform3D({basis[0]:.6g}, {basis[1]:.6g}, {basis[2]:.6g}, {basis[3]:.6g}, {basis[4]:.6g}, {basis[5]:.6g}, {basis[6]:.6g}, {basis[7]:.6g}, {basis[8]:.6g}, {gx:.6g}, {gy:.6g}, {gz:.6g})"
+                node_name = f"{os.path.splitext(os.path.basename(prefab_path))[0]}_{idx + 1}"
+                is_active = re.search(r"propertyPath: m_IsActive\s*\n\s*value: (\d)", b)
+                extra = ["visible = false"] if (is_active and is_active.group(1) == "0") else []
+                nodes_data.append((node_name, res_id, t_str, extra))
+
+            if not nodes_data:
+                continue
+
+            # --- Lighting & Environment pass ---
+            sub_resources: List[str] = []
+            load_steps = len(ext_resources) + 1
+
+            ambient_m = re.search(
+                r"m_AmbientSkyColor:\s*\{r:\s*([\d.eE+-]+),\s*g:\s*([\d.eE+-]+),\s*b:\s*([\d.eE+-]+)",
+                raw
+            )
+            fog_on = re.search(r"^\s*m_Fog:\s*(\d+)", raw, re.M)
+            fogcol_m = re.search(
+                r"m_FogColor:\s*\{r:\s*([\d.eE+-]+),\s*g:\s*([\d.eE+-]+),\s*b:\s*([\d.eE+-]+)",
+                raw
+            )
+            fogden_m = re.search(r"m_FogDensity:\s*([\d.eE+-]+)", raw)
+            has_env = False
+            env_lines = []
+            if ambient_m:
+                ar, ag, ab_ = float(ambient_m.group(1)), float(ambient_m.group(2)), float(ambient_m.group(3))
+                if ar + ag + ab_ > 0.01:
+                    load_steps += 2  # Environment + ProceduralSkyMaterial
+                    sub_resources.append(
+                        '[sub_resource type="ProceduralSkyMaterial" id="SkyMat"]\n'
+                        f"sky_top_color = Color({ar:.4g}, {ag:.4g}, {ab_:.4g}, 1)\n"
+                        f"sky_horizon_color = Color({ar:.4g}, {ag:.4g}, {ab_:.4g}, 1)\n"
+                        "ground_bottom_color = Color(0.12, 0.12, 0.14, 1)\n"
+                        "ground_horizon_color = Color(0.2, 0.2, 0.22, 1)\n"
+                    )
+                    sub_resources.append(
+                        '[sub_resource type="Sky" id="Sky"]\n'
+                        'sky_material = SubResource("SkyMat")\n'
+                    )
+                    env_lines = [
+                        'environment = SubResource("Env")',
+                    ]
+                    has_env = True
+
+            light_nodes = []
+            for lm in re.finditer(r"--- !u!108 &(\d+)\s*\nLight:\s*\n([\s\S]*?)(?=--- !u!)", raw):
+                lb = lm.group(2)
+                ltype_m = re.search(r"m_Type:\s*(\d+)", lb)
+                color_m = re.search(r"m_Color:\s*\{r:\s*([\d.eE+-]+),\s*g:\s*([\d.eE+-]+),\s*b:\s*([\d.eE+-]+)", lb)
+                range_m = re.search(r"m_Range:\s*([\d.eE+-]+)", lb)
+                inten_m = re.search(r"m_Intensity:\s*([\d.eE+-]+)", lb)
+                go_m = re.search(r"m_GameObject:\s*\{fileID:\s*(\d+)", lb)
+
+                ltype = ltype_m.group(1) if ltype_m else "2"
+                lcol = (
+                    float(color_m.group(1)),
+                    float(color_m.group(2)),
+                    float(color_m.group(3))
+                ) if color_m else (1.0, 1.0, 1.0)
+                lrange = float(range_m.group(1)) if range_m else 10.0
+                linten = float(inten_m.group(1)) if inten_m else 1.0
+
+                # Find the Transform for this light's GameObject
+                l_tf_id = None
+                for tf_id, t in transforms.items():
+                    if t["goid"] == (go_m.group(1) if go_m else None):
+                        l_tf_id = tf_id
+                        break
+
+                if l_tf_id and l_tf_id in transforms:
+                    lw_pos, lw_rot, _ = get_world_transform(l_tf_id)
+                else:
+                    lw_pos, lw_rot = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
+
+                gx, gy, gz = lw_pos[0], lw_pos[1], -lw_pos[2]
+                qx, qy, qz, qw = lw_rot[0], lw_rot[1], -lw_rot[2], -lw_rot[3]
+                basis = quat_to_basis(qx, qy, qz, qw)
+                t_str = f"Transform3D({basis[0]:.6g}, {basis[1]:.6g}, {basis[2]:.6g}, {basis[3]:.6g}, {basis[4]:.6g}, {basis[5]:.6g}, {basis[6]:.6g}, {basis[7]:.6g}, {basis[8]:.6g}, {gx:.6g}, {gy:.6g}, {gz:.6g})"
+
+                col_str = f"Color({lcol[0]:.4g}, {lcol[1]:.4g}, {lcol[2]:.4g}, 1)"
+                energy = max(0.05, linten * 0.4)
+
+                if ltype == "2":  # Point -> OmniLight3D
+                    props = [
+                        f"light_color = {col_str}",
+                        f"light_energy = {energy:.4g}",
+                        f"omni_range = {max(0.1, lrange):.6g}",
+                        "shadow_enabled = false",
+                    ]
+                    light_nodes.append((f"PointLight_{lm.group(1)}", "OmniLight3D", t_str, props))
+                elif ltype == "0":  # Spot -> SpotLight3D
+                    props = [
+                        f"light_color = {col_str}",
+                        f"light_energy = {energy:.4g}",
+                        f"spot_range = {max(0.1, lrange):.6g}",
+                        "spot_angle = 45.0",
+                        "shadow_enabled = false",
+                    ]
+                    light_nodes.append((f"SpotLight_{lm.group(1)}", "SpotLight3D", t_str, props))
+                elif ltype == "1":  # Directional -> DirectionalLight3D
+                    props = [
+                        f"light_color = {col_str}",
+                        f"light_energy = {max(0.05, linten * 0.25):.4g}",
+                        "shadow_enabled = false",
+                    ]
+                    light_nodes.append((f"DirectionalLight_{lm.group(1)}", "DirectionalLight3D", t_str, props))
+
+            camera_nodes = []
+            cam_current_set = False
+            for cm in re.finditer(r"--- !u!20 &(\d+)\s*\nCamera:\s*\n([\s\S]*?)(?=--- !u!)", raw):
+                cb = cm.group(2)
+                cgo_m = re.search(r"m_GameObject:\s*\{fileID:\s*(\d+)", cb)
+                if not cgo_m:
+                    continue
+                c_tf_id = None
+                for tf_id, t in transforms.items():
+                    if t["goid"] == cgo_m.group(1):
+                        c_tf_id = tf_id
+                        break
+                if not c_tf_id or c_tf_id not in transforms:
+                    continue
+                cw_pos, cw_rot, _ = get_world_transform(c_tf_id)
+                cx, cy, cz = cw_pos[0], cw_pos[1], -cw_pos[2]
+                cqx, cqy, cqz, cqw = cw_rot[0], cw_rot[1], -cw_rot[2], -cw_rot[3]
+                c_basis = quat_to_basis(cqx, cqy, cqz, cqw)
+                ct_str = f"Transform3D({c_basis[0]:.6g}, {c_basis[1]:.6g}, {c_basis[2]:.6g}, {c_basis[3]:.6g}, {c_basis[4]:.6g}, {c_basis[5]:.6g}, {c_basis[6]:.6g}, {c_basis[7]:.6g}, {c_basis[8]:.6g}, {cx:.6g}, {cy:.6g}, {cz:.6g})"
+                fov_m = re.search(r"field of view:\s*([\d.eE+-]+)", cb)
+                near_m = re.search(r"near clip plane:\s*([\d.eE+-]+)", cb)
+                far_m = re.search(r"far clip plane:\s*([\d.eE+-]+)", cb)
+                ortho_m = re.search(r"m_orthographic:\s*(\d+)", cb)
+                size_m = re.search(r"orthographic size:\s*([\d.eE+-]+)", cb)
+                enab_m = re.search(r"m_Enabled:\s*(\d+)", cb)
+                gname_m = re.search(r"--- !u!1 &" + cgo_m.group(1) + r"\b\s*\nGameObject:\s*\n[\s\S]*?\nm_Name: ([^\n]+)", raw)
+                cname = re.sub(r'[."/:]', "_", gname_m.group(1).strip()) if gname_m else ""
+                if not cname or any(n[0] == cname for n in camera_nodes):
+                    cname = f"Camera_{cm.group(1)}"
+                cprops = []
+                if ortho_m and ortho_m.group(1) == "1":
+                    cprops.append("projection = 1")
+                    if size_m:
+                        cprops.append(f"size = {float(size_m.group(1)):.6g}")
+                elif fov_m:
+                    cprops.append(f"fov = {float(fov_m.group(1)):.6g}")
+                if near_m:
+                    cprops.append(f"near = {float(near_m.group(1)):.6g}")
+                if far_m:
+                    cprops.append(f"far = {float(far_m.group(1)):.6g}")
+                if enab_m and enab_m.group(1) != "1":
+                    cprops.append("enabled = false")
+                elif not cam_current_set:
+                    cprops.append("current = true")
+                    cam_current_set = True
+                camera_nodes.append((cname, "Camera3D", ct_str, cprops))
+
+            if not has_env and not light_nodes and not nodes_data and not camera_nodes:
+                continue
+
+            if has_env:
+                env_body = (
+                    '[sub_resource type="Environment" id="Env"]\n'
+                    "background_mode = 2\n"
+                    "ambient_light_source = 2\n"
+                    f"ambient_light_color = Color({ar:.4g}, {ag:.4g}, {ab_:.4g}, 1)\n"
+                    "ambient_light_energy = 1.0\n"
+                    "tonemap_mode = 2\n"
+                    "glow_enabled = true\n"
+                )
+                if fog_on and fog_on.group(1) == "1" and fogcol_m:
+                    fr, fg_, fb = float(fogcol_m.group(1)), float(fogcol_m.group(2)), float(fogcol_m.group(3))
+                    dens = float(fogden_m.group(1)) if fogden_m else 0.001
+                    env_body += (
+                        "fog_enabled = true\n"
+                        f"fog_light_color = Color({fr:.4g}, {fg_:.4g}, {fb:.4g}, 1)\n"
+                        f"fog_density = {max(0.0005, dens * dens * 150.0):.4g}\n"
+                    )
+                sub_resources.append(env_body)
+
+            total_steps = len(ext_resources) + (len(sub_resources) if has_env else 0) + 1
+            tscn_lines = [f'[gd_scene load_steps={total_steps} format=3]\n']
+            for path, rid in ext_resources.items():
+                tscn_lines.append(f'[ext_resource type="PackedScene" path="{path}" id="{rid}"]')
+
+            for sr in sub_resources:
+                tscn_lines.append("\n" + sr)
+
+            tscn_lines.append(f'\n[node name="{scene_name}" type="Node3D"]')
+
+            if has_env:
+                tscn_lines.append(f'\n[node name="Environment" type="WorldEnvironment" parent="."]')
+                for el in env_lines:
+                    tscn_lines.append(el)
+
+            for n_name, rid, t_str, nextra in nodes_data:
+                tscn_lines.append(f'\n[node name="{n_name}" parent="." instance=ExtResource("{rid}")]')
+                tscn_lines.append(f'transform = {t_str}')
+                for x_line in nextra:
+                    tscn_lines.append(x_line)
+
+            for n_name, ntype, t_str, nprops in light_nodes:
+                tscn_lines.append(f'\n[node name="{n_name}" type="{ntype}" parent="."]')
+                tscn_lines.append(f'transform = {t_str}')
+                for p_line in nprops:
+                    tscn_lines.append(p_line)
+
+            for n_name, ntype, t_str, nprops in camera_nodes:
+                tscn_lines.append(f'\n[node name="{n_name}" type="{ntype}" parent="."]')
+                tscn_lines.append(f'transform = {t_str}')
+                for p_line in nprops:
+                    tscn_lines.append(p_line)
+
+            with open(out_tscn, "w", encoding="utf-8") as out:
+                out.write("\n".join(tscn_lines) + "\n")
+
+            compiled += 1
+            if out_tscn not in categorized_files["tscn"]:
+                categorized_files["tscn"].append(out_tscn)
+
+        except Exception as exc:
+            fail_warn(f"Failed to compile scene {uscene}: {exc}")
+
+    return compiled
+
+
+# ==============================================================================
 # Pipeline Execution & CLI
 # ==============================================================================
 def run_pipeline(
@@ -1184,38 +1699,41 @@ def run_pipeline(
         packages_to_extract.extend(categorized_files.get("unitypackages", []))
 
     if packages_to_extract:
-        print(f"\n[0/5] Extracting {len(packages_to_extract)} UnityPackage(s)...", flush=True)
+        print(f"\n[0/6] Extracting {len(packages_to_extract)} UnityPackage(s)...", flush=True)
         for pkg in packages_to_extract:
             print(f"      - Unpacking {os.path.basename(pkg)}...", flush=True)
             extracted = extract_unitypackage(pkg, project_root)
             print(f"        -> Extracted {extracted} files.", flush=True)
-        # Refresh file index after extraction
         categorized_files = collect_project_files(project_root)
 
-    print("\n[1/5] Sanitizing Textures & Resolving Missing Resources...", flush=True)
+    print("\n[1/6] Sanitizing Textures & Resolving Missing Resources...", flush=True)
     fixed_tex, aliases, norm_tex = sanitize_and_resolve_textures(project_root, categorized_files)
     print(f"      - Fixed misnamed image formats: {fixed_tex}", flush=True)
-    print(f"      - Generated missing texture & PSD alias stubs: {aliases}", flush=True)
+    print(f"      - Generated missing texture stubs: {aliases}", flush=True)
     print(f"      - Normalized sRGB & normal map import settings: {norm_tex}", flush=True)
 
-    print("\n[2/5] Parsing Unity Package Materials & Rebuilding StandardMaterial3D...", flush=True)
+    print("\n[2/6] Parsing Unity Package Materials & Rebuilding StandardMaterial3D...", flush=True)
     rebuilt_mats, pack_prefab_mappings = synchronize_unitypackage_materials(project_root, categorized_files)
     total_bindings = sum(len(m) for m in pack_prefab_mappings.values())
     print(f"      - Synchronized & generated {rebuilt_mats} materials from Unity definitions.", flush=True)
     print(f"      - Loaded {total_bindings} deterministic model-to-material prefab bindings across {len(pack_prefab_mappings)} packs.", flush=True)
 
-    print("\n[3/5] Deep Scanning & Mapping FBX Material Slots...", flush=True)
+    print("\n[3/6] Deep Scanning & Mapping FBX Material Slots...", flush=True)
     models, slots = map_all_fbx_materials(project_root, categorized_files, pack_prefab_mappings)
     print(f"      - Mapped {slots} material slots across {models} FBX models.", flush=True)
 
-    print("\n[4/5] Rectifying Character Rigs & Multi-Mesh Visibility...", flush=True)
+    print("\n[4/6] Rectifying Character Rigs & Multi-Mesh Visibility...", flush=True)
     fixed_skels, fixed_chars = fix_character_rigs_and_visibility(categorized_files)
     print(f"      - Updated GeneralSkeleton -> Skeleton3D in {fixed_skels} scenes/prefabs.", flush=True)
     print(f"      - Applied selective mesh visibility to {fixed_chars} character prefabs.", flush=True)
 
-    print("\n[5/5] Synchronizing Scene & Resource UIDs...", flush=True)
+    print("\n[5/6] Synchronizing Scene & Resource UIDs...", flush=True)
     synced_scenes, fixed_uids = synchronize_uids(project_root, categorized_files)
     print(f"      - Synchronized {fixed_uids} resource UIDs across {synced_scenes} scene files.", flush=True)
+
+    print("\n[6/6] Compiling Unity Demo & Overview Scenes to Godot (.tscn)...", flush=True)
+    compiled_scenes = compile_unity_scenes(project_root, categorized_files)
+    print(f"      - Compiled {compiled_scenes} native Godot scene(s) from Unity definitions.", flush=True)
 
     if purge_cache:
         print("\n[Optional] Purging Stale Compiled Binary Cache...", flush=True)
