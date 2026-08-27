@@ -140,6 +140,22 @@ def quat_to_basis(x: float, y: float, z: float, w: float, sx: float = 1.0, sy: f
     return (r00, r01, r02, r10, r11, r12, r20, r21, r22)
 
 
+def unity_to_godot_transform(
+    position: Tuple[float, float, float],
+    rotation: Tuple[float, float, float, float],
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]:
+    """Convert a Unity world transform to Godot's imported FBX convention.
+
+    Godot's FBX importer bakes Synty meshes in the -X convention. Unity
+    positions therefore negate X, while Unity quaternions negate Y and Z;
+    W is preserved. Keeping this conversion centralized prevents scene nodes,
+    lights, and cameras from using different mirror axes.
+    """
+    px, py, pz = position
+    qx, qy, qz, qw = rotation
+    return (-px, py, pz), (qx, -qy, -qz, qw)
+
+
 # ==============================================================================
 # 1. UnityPackage Extraction & Deterministic YAML Parser
 # ==============================================================================
@@ -1395,7 +1411,43 @@ def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[st
                 scale = {"x": 1.0, "y": 1.0, "z": 1.0}
 
                 lines = b.splitlines()
+                # Unity writes overrides for the prefab root and nested
+                # objects in one list. The stripped Transform record identifies
+                # the actual prefab-root source file ID.
+                instance_id = lines[0].strip() if lines else ""
+                root_source_m = re.search(
+                    rf"--- !u!4 &[^\n]+ stripped\nTransform:\n"
+                    rf"\s*m_CorrespondingSourceObject:\s*\{{fileID:\s*([^,}}]+).*?\n"
+                    rf"\s*m_PrefabInstance:\s*\{{fileID:\s*{re.escape(instance_id)}\}}",
+                    b,
+                    re.S,
+                )
+                root_source_id = root_source_m.group(1).strip() if root_source_m else None
+                if root_source_id == "0":
+                    root_source_id = None
+                if root_source_id is None:
+                    target_id = None
+                    target_paths: Set[str] = set()
+                    for line in lines:
+                        target_m = re.search(r"- target:\s*\{fileID:\s*([^,}]+)", line)
+                        if target_m:
+                            if {"m_LocalPosition.x", "m_LocalRotation.w"}.issubset(target_paths):
+                                root_source_id = target_id
+                                break
+                            target_id = target_m.group(1).strip()
+                            target_paths = set()
+                        path_m = re.search(r"propertyPath:\s*(\S+)", line)
+                        if path_m:
+                            target_paths.add(path_m.group(1))
+                    if root_source_id is None and {"m_LocalPosition.x", "m_LocalRotation.w"}.issubset(target_paths):
+                        root_source_id = target_id
+                current_target = None
                 for i, line in enumerate(lines):
+                    target_m = re.search(r"- target:\s*\{fileID:\s*([^,}]+)", line)
+                    if target_m:
+                        current_target = target_m.group(1).strip()
+                    if root_source_id is None or current_target != root_source_id:
+                        continue
                     if "propertyPath: m_LocalPosition." in line:
                         axis = line.strip()[-1]
                         for off in (1, 2):
@@ -1437,14 +1489,9 @@ def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[st
                     w_rot = (rot["x"], rot["y"], rot["z"], rot["w"])
                     w_scale = (scale["x"], scale["y"], scale["z"])
 
-                gx = w_pos[0]
-                gy = w_pos[1]
-                gz = -w_pos[2]
-
-                qx = w_rot[0]
-                qy = w_rot[1]
-                qz = -w_rot[2]
-                qw = -w_rot[3]
+                godot_pos, godot_rot = unity_to_godot_transform(w_pos, w_rot)
+                gx, gy, gz = godot_pos
+                qx, qy, qz, qw = godot_rot
 
                 basis = quat_to_basis(qx, qy, qz, qw, w_scale[0], w_scale[1], w_scale[2])
                 t_str = f"Transform3D({basis[0]:.6g}, {basis[1]:.6g}, {basis[2]:.6g}, {basis[3]:.6g}, {basis[4]:.6g}, {basis[5]:.6g}, {basis[6]:.6g}, {basis[7]:.6g}, {basis[8]:.6g}, {gx:.6g}, {gy:.6g}, {gz:.6g})"
@@ -1522,8 +1569,9 @@ def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[st
                 else:
                     lw_pos, lw_rot = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
 
-                gx, gy, gz = lw_pos[0], lw_pos[1], -lw_pos[2]
-                qx, qy, qz, qw = lw_rot[0], lw_rot[1], -lw_rot[2], -lw_rot[3]
+                godot_pos, godot_rot = unity_to_godot_transform(lw_pos, lw_rot)
+                gx, gy, gz = godot_pos
+                qx, qy, qz, qw = godot_rot
                 basis = quat_to_basis(qx, qy, qz, qw)
                 t_str = f"Transform3D({basis[0]:.6g}, {basis[1]:.6g}, {basis[2]:.6g}, {basis[3]:.6g}, {basis[4]:.6g}, {basis[5]:.6g}, {basis[6]:.6g}, {basis[7]:.6g}, {basis[8]:.6g}, {gx:.6g}, {gy:.6g}, {gz:.6g})"
 
@@ -1570,8 +1618,9 @@ def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[st
                 if not c_tf_id or c_tf_id not in transforms:
                     continue
                 cw_pos, cw_rot, _ = get_world_transform(c_tf_id)
-                cx, cy, cz = cw_pos[0], cw_pos[1], -cw_pos[2]
-                cqx, cqy, cqz, cqw = cw_rot[0], cw_rot[1], -cw_rot[2], -cw_rot[3]
+                godot_pos, godot_rot = unity_to_godot_transform(cw_pos, cw_rot)
+                cx, cy, cz = godot_pos
+                cqx, cqy, cqz, cqw = godot_rot
                 c_basis = quat_to_basis(cqx, cqy, cqz, cqw)
                 ct_str = f"Transform3D({c_basis[0]:.6g}, {c_basis[1]:.6g}, {c_basis[2]:.6g}, {c_basis[3]:.6g}, {c_basis[4]:.6g}, {c_basis[5]:.6g}, {c_basis[6]:.6g}, {c_basis[7]:.6g}, {c_basis[8]:.6g}, {cx:.6g}, {cy:.6g}, {cz:.6g})"
                 fov_m = re.search(r"field of view:\s*([\d.eE+-]+)", cb)
