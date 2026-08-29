@@ -21,13 +21,16 @@ Usage:
 """
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import struct
 import sys
 import tarfile
+import zlib
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 try:
     from PIL import Image
@@ -590,11 +593,104 @@ def read_fbx_properties(data: bytes, offset: int, num_props: int) -> Tuple[List[
             curr += length
         elif type_code in ('f', 'd', 'l', 'i', 'b'):
             arr_len, enc, comp_len = struct.unpack("<III", data[curr:curr + 12])
-            curr += 12 + comp_len
-            props.append(None)
+            curr += 12
+            payload = data[curr:curr + comp_len]
+            curr += comp_len
+            values = None
+            if enc == 1:
+                try:
+                    payload = zlib.decompress(payload)
+                except zlib.error:
+                    payload = b''
+            if enc in (0, 1):
+                fmt = {'f': 'f', 'd': 'd', 'l': 'q', 'i': 'i', 'b': 'b'}[type_code]
+                size = struct.calcsize('<' + fmt)
+                if len(payload) == arr_len * size:
+                    values = list(struct.unpack('<' + fmt * arr_len, payload))
+            props.append(values)
         else:
             break
     return props, curr
+
+
+def resolve_geometry_material_record(
+    geometry_id: int,
+    model_id: Optional[int],
+    mapping: str,
+    reference: str,
+    material_indices: List[int],
+    model_material_ids: List[int],
+) -> Dict[str, Any]:
+    """Build an ID-keyed material-layer record without guessing incomplete slots."""
+    authoritative = bool(
+        model_id is not None and mapping in ("AllSame", "ByPolygon", "ByVertex", "ByVertice")
+        and reference in ("Direct", "IndexToDirect")
+    )
+    material_ids: List[int] = []
+    if authoritative:
+        indices = material_indices
+        if reference == "IndexToDirect":
+            # IndexToDirect entries select entries in the direct model-slot list.
+            if any(index < 0 or index >= len(model_material_ids) for index in indices):
+                authoritative = False
+            else:
+                indices = [model_material_ids[index] for index in indices]
+        else:
+            if any(index < 0 for index in indices):
+                authoritative = False
+        if authoritative:
+            # Preserve the first-occurrence order encoded by the layer array.
+            material_ids = list(dict.fromkeys(indices))
+    return {
+        "geometry_id": geometry_id,
+        "model_id": model_id,
+        "mapping": mapping,
+        "reference": reference,
+        "material_indices": material_indices,
+        "material_ids": material_ids,
+        "authoritative": authoritative,
+    }
+
+
+def extract_geometry_material_layers(
+    geometry_node: Tuple[str, List[Any], List[Any]],
+) -> Dict[int, Dict[str, Any]]:
+    """Extract nested LayerElementMaterial nodes keyed by Geometry ID."""
+    geometry_id = geometry_node[1][0] if geometry_node[1] else None
+    if geometry_id is None:
+        return {}
+
+    def descendants(
+        node: Tuple[str, List[Any], List[Any]],
+    ) -> Iterator[Tuple[str, List[Any], List[Any]]]:
+        for child in node[2]:
+            yield child
+            yield from descendants(child)
+
+    records: Dict[int, Dict[str, Any]] = {}
+    for layer in descendants(geometry_node):
+        if layer[0] != "LayerElementMaterial":
+            continue
+        mapping = ""
+        reference = ""
+        material_indices = None
+        for property_node in descendants(layer):
+            if property_node[0] == "MappingInformationType" and property_node[1]:
+                mapping = str(property_node[1][0])
+            elif property_node[0] == "ReferenceInformationType" and property_node[1]:
+                reference = str(property_node[1][0])
+            elif property_node[0] == "Materials" and property_node[1]:
+                material_indices = property_node[1][0]
+        if isinstance(material_indices, list):
+            records[geometry_id] = {
+                "geometry_id": geometry_id,
+                "model_id": None,
+                "mapping": mapping,
+                "reference": reference,
+                "material_indices": material_indices,
+                "authoritative": bool(mapping and reference),
+            }
+    return records
 
 
 def parse_fbx_graph(file_path: str) -> Dict[str, Any]:
@@ -649,6 +745,9 @@ def parse_fbx_graph(file_path: str) -> Dict[str, Any]:
 
     objects = next((n for n in root if n[0] == "Objects"), None)
     materials: Dict[int, str] = {}
+    models: Dict[int, str] = {}
+    geometries_by_id: Dict[int, Any] = {}
+    geometry_materials_by_id: Dict[int, Dict[str, Any]] = {}
     textures: Dict[int, Tuple[str, str]] = {}
     videos: Dict[int, str] = {}
     has_skin = False
@@ -659,6 +758,13 @@ def parse_fbx_graph(file_path: str) -> Dict[str, Any]:
                 mat_id = c_props[0]
                 mat_name = str(c_props[1]).split(chr(0))[0].split("::")[-1]
                 materials[mat_id] = mat_name
+            elif c_name == "Model" and len(c_props) >= 2:
+                model_id = c_props[0]
+                models[model_id] = str(c_props[1]).split(chr(0))[0].split("::")[-1]
+            elif c_name == "Geometry" and c_props:
+                geometry_id = c_props[0]
+                geometries_by_id[geometry_id] = c
+                geometry_materials_by_id.update(extract_geometry_material_layers(c))
             elif c_name == "Deformer" and len(c_props) >= 3 and c_props[2] == "Skin":
                 has_skin = True
             elif c_name == "Texture" and len(c_props) >= 2:
@@ -682,6 +788,8 @@ def parse_fbx_graph(file_path: str) -> Dict[str, Any]:
     connections_node = next((n for n in root if n[0] == "Connections"), None)
     mat_to_textures: Dict[int, List[str]] = {}
     texture_videos: Dict[int, List[str]] = {}
+    model_material_ids: Dict[int, List[int]] = {}
+    geometry_model_ids: Dict[int, int] = {}
     if connections_node:
         connections = [c[1] for c in connections_node[2] if len(c[1]) >= 3]
         # FBX stores the Video -> Texture edge separately from the
@@ -698,13 +806,62 @@ def parse_fbx_graph(file_path: str) -> Dict[str, Any]:
                 linked_videos = texture_videos.get(child_id, [])
                 final_path = (linked_videos[0] if linked_videos else tfname) or tname
                 mat_to_textures.setdefault(parent_id, []).append(final_path)
+            elif kind in ("OO", "OP") and parent_id in models and child_id in materials:
+                model_material_ids.setdefault(parent_id, []).append(child_id)
+            elif kind == "OO" and parent_id in models and child_id in geometries_by_id:
+                geometry_model_ids[child_id] = parent_id
+
+    model_material_ids_by_id: Dict[int, List[int]] = {}
+    for geometry_id, old_record in list(geometry_materials_by_id.items()):
+        model_id = geometry_model_ids.get(geometry_id)
+        record = resolve_geometry_material_record(
+            geometry_id,
+            model_id,
+            old_record.get("mapping", ""),
+            old_record.get("reference", ""),
+            old_record.get("material_indices", []),
+            model_material_ids.get(model_id, []) if model_id is not None else [],
+        )
+        geometry_materials_by_id[geometry_id] = record
+        if model_id is not None and record["authoritative"]:
+            model_material_ids_by_id[model_id] = list(dict.fromkeys(
+                model_material_ids_by_id.get(model_id, []) + record["material_ids"]
+            ))
 
     slot_to_tex: Dict[str, List[str]] = {}
     for mid, mname in materials.items():
         slot_to_tex[mname] = mat_to_textures.get(mid, [])
 
+    geometry_nodes_by_id = geometries_by_id
+    geometries_by_id = {
+        geometry_id: {
+            "geometry_id": geometry_id,
+            "name": str(node[1][1]).split(chr(0))[0].split("::")[-1] if len(node[1]) > 1 else "",
+            "model_id": geometry_model_ids.get(geometry_id),
+            "node": node,
+        }
+        for geometry_id, node in geometry_nodes_by_id.items()
+    }
+
+    model_names = list(models.values())
+    duplicate_model_names = {name for name in model_names if model_names.count(name) > 1}
+    model_materials = {
+        models[model_id]: [materials[mid] for mid in material_ids if mid in materials]
+        for model_id, material_ids in model_material_ids.items()
+        if models.get(model_id) not in duplicate_model_names
+    }
+
     return {
         "materials": materials,
+        "models": models,
+        "models_by_id": models,
+        "geometries_by_id": geometries_by_id,
+        "geometry_model_ids": geometry_model_ids,
+        "geometry_materials_by_id": geometry_materials_by_id,
+        "geometry_material_layers": geometry_materials_by_id,
+        "model_material_ids_by_id": model_material_ids_by_id,
+        "model_materials": model_materials,
+        "ambiguous_model_names": sorted(duplicate_model_names),
         "textures": textures,
         "videos": videos,
         "mat_to_textures": slot_to_tex,
@@ -715,12 +872,252 @@ def parse_fbx_graph(file_path: str) -> Dict[str, Any]:
 # ==============================================================================
 # 4. Deterministic Material Synchronization & Slot Resolution
 # ==============================================================================
+def parse_unity_prefab_renderer_contexts(raw_yaml: str) -> List[Dict[str, Any]]:
+    """Return each Unity renderer's node name, mesh GUID, and ordered material GUIDs."""
+    game_names = {
+        match.group(1): name.group(1).strip()
+        for match in re.finditer(
+            r"--- !u!1 &(\d+)\s*\nGameObject:\s*\n(.*?)(?=^--- !u!|\Z)",
+            raw_yaml, re.S | re.M
+        )
+        for name in [re.search(r"^\s*m_Name:\s*(.+?)\s*$", match.group(2), re.M)]
+        if name
+    }
+    mesh_by_go = {}
+    for match in re.finditer(
+        r"--- !u!(?:33|137) &\d+\s*\n(?:MeshFilter|SkinnedMeshRenderer):\s*\n(.*?)(?=^--- !u!|\Z)",
+        raw_yaml, re.S | re.M
+    ):
+        go = re.search(r"m_GameObject:\s*\{fileID:\s*(\d+)\}", match.group(1))
+        mesh = re.search(r"m_Mesh:\s*\{fileID:[^,]+,\s*guid:\s*([a-f0-9]{32})", match.group(1))
+        if go and mesh:
+            mesh_by_go[go.group(1)] = mesh.group(1)
+    contexts = []
+    for match in re.finditer(
+        r"--- !u!(?:23|137) &\d+\s*\n(?:MeshRenderer|SkinnedMeshRenderer):\s*\n(.*?)(?=^--- !u!|\Z)",
+        raw_yaml, re.S | re.M
+    ):
+        block = match.group(1)
+        go = re.search(r"m_GameObject:\s*\{fileID:\s*(\d+)\}", block)
+        materials_block = re.search(
+            r"m_Materials:\s*\n((?:\s*-\s*\{[^\n]+\}\s*\n?)+)", block
+        )
+        if not go:
+            continue
+        go_id = go.group(1)
+        material_slots = []
+        if materials_block:
+            for item in re.findall(r"^\s*-\s*\{([^\n]+)\}", materials_block.group(1), re.M):
+                guid = re.search(r"guid:\s*([a-f0-9]{32})", item)
+                # Keep null Unity material entries as positional placeholders.
+                material_slots.append(guid.group(1) if guid else "")
+        contexts.append({
+            "name": game_names.get(go_id, go_id),
+            "game_object_id": go_id,
+            "mesh_guid": mesh_by_go.get(go_id, ""),
+            "materials": material_slots,
+        })
+    return contexts
+
+
+def build_contextual_material_overrides(
+    graph: Dict[str, Any],
+    renderer_contexts: List[Dict[str, Any]],
+    material_by_fbx_name: Dict[str, str],
+    resource_by_material_name: Dict[str, str],
+) -> Dict[str, Dict[int, str]]:
+    """Map only conflicting FBX material uses to renderer-specific surfaces."""
+    overrides: Dict[str, Dict[int, str]] = {}
+    ambiguous_model_names = set(graph.get("ambiguous_model_names", []))
+    # Contextual overrides require an explicit Geometry layer. Legacy model
+    # names alone do not establish which renderer owns a material slot.
+    canonical_model_materials: Dict[str, Tuple[List[int], List[str]]] = {}
+    authoritative_material_orders: Dict[str, List[int]] = {}
+    invalid_model_names: Set[str] = set()
+    models_by_id = graph.get("models_by_id", graph.get("models", {}))
+    materials_by_id = graph.get("materials", {})
+    connected_by_model = graph.get("model_material_ids_by_id", {})
+    geometry_layers = graph.get("geometry_materials_by_id")
+    if geometry_layers is None:
+        # Keep compatibility with the parser's original public alias.
+        geometry_layers = graph.get("geometry_material_layers", {})
+
+    for record in geometry_layers.values():
+        if not record.get("authoritative"):
+            continue
+        model_id = record.get("model_id")
+        model_name = models_by_id.get(model_id)
+        if not model_name:
+            continue
+        # Refuse the whole model if any authoritative geometry declares a
+        # different material order, even when its mapping is not usable for
+        # generating an override. Otherwise an unsupported layer can hide a
+        # real conflict while a different layer supplies the canonical order.
+        declared_ids = list(record.get("material_ids", []))
+        if declared_ids:
+            existing_order = authoritative_material_orders.get(model_name)
+            if existing_order is not None and existing_order != declared_ids:
+                invalid_model_names.add(model_name)
+            else:
+                authoritative_material_orders[model_name] = declared_ids
+        connected_material_ids = list(connected_by_model.get(model_id, []))
+        mapping = record.get("mapping")
+        reference = record.get("reference")
+        # Test/compatibility graph records may already contain the resolved
+        # ordered IDs. Treat those as authoritative, but still validate them
+        # against the model connections and the other geometry records below.
+        if not mapping and not reference and "material_ids" in record:
+            ordered_ids = list(record.get("material_ids", []))
+            if not ordered_ids or any(material_id not in connected_material_ids for material_id in ordered_ids):
+                invalid_model_names.add(model_name)
+                continue
+        else:
+            if mapping not in ("AllSame", "ByPolygon"):
+                # Unsupported layers cannot establish a canonical slot order,
+                # but their declared order was checked above for conflicts.
+                # Let a supported layer preserve the real renderer mapping.
+                continue
+            indices = list(record.get("material_indices", []))
+            if mapping == "AllSame" and len(indices) != 1:
+                invalid_model_names.add(model_name)
+                continue
+            if reference == "IndexToDirect":
+                if any(not isinstance(index, int) or index < 0 or index >= len(connected_material_ids) for index in indices):
+                    invalid_model_names.add(model_name)
+                    continue
+                ordered_ids = [connected_material_ids[index] for index in indices]
+            elif reference == "Direct":
+                ordered_ids = indices
+                if any(material_id not in connected_material_ids for material_id in ordered_ids):
+                    invalid_model_names.add(model_name)
+                    continue
+            else:
+                invalid_model_names.add(model_name)
+                continue
+        ordered_ids = list(dict.fromkeys(ordered_ids))
+        # The authoritative IDs must agree with the sequence rebuilt from
+        # layer indices and ordered model connections.
+        if not ordered_ids or list(record.get("material_ids", [])) != ordered_ids:
+            invalid_model_names.add(model_name)
+            continue
+        names = [materials_by_id[mid] for mid in ordered_ids if mid in materials_by_id]
+        if len(names) != len(ordered_ids):
+            invalid_model_names.add(model_name)
+            continue
+        existing = canonical_model_materials.get(model_name)
+        if existing and existing[0] != ordered_ids:
+            invalid_model_names.add(model_name)
+            continue
+        canonical_model_materials[model_name] = (ordered_ids, names)
+    for model_name, fbx_slots in graph.get("model_materials", {}).items():
+        if (
+            model_name in ambiguous_model_names
+            or model_name in invalid_model_names
+            or model_name not in canonical_model_materials
+        ):
+            continue
+        connected_ids, connected_names = canonical_model_materials[model_name]
+        # Every FBX-wide slot must be a connected material slot. This keeps
+        # renderer indices from being applied to stale or guessed materials.
+        if not connected_names or any(name not in connected_names for name in fbx_slots):
+            continue
+        candidates = [context for context in renderer_contexts if context.get("name") == model_name]
+        # Do not guess when duplicate source node names make renderer identity
+        # ambiguous. A skipped contextual override preserves the existing
+        # FBX-wide fallback instead of changing an unrelated renderer.
+        if len(candidates) != 1:
+            continue
+        unity_slots = candidates[0].get("materials", [])
+        for index, fbx_name in enumerate(fbx_slots):
+            if index >= len(unity_slots) or index >= len(connected_ids):
+                continue
+            resource = resource_by_material_name.get(
+                unity_slots[index],
+                unity_slots[index] if unity_slots[index].startswith("res://") else "",
+            )
+            if resource and resource != material_by_fbx_name.get(fbx_name, ""):
+                overrides.setdefault(model_name, {})[index] = resource
+    return overrides
+
+
+def generate_contextual_import_script(
+    project_root: str,
+    fbx_path: str,
+    overrides: Dict[str, Dict[int, str]],
+) -> str:
+    """Write a post-import script for node-specific surface material overrides."""
+    if not overrides:
+        return ""
+    fbx_stem = os.path.splitext(os.path.basename(fbx_path))[0]
+    path_tag = hashlib.sha1(os.path.normpath(fbx_path).encode("utf-8")).hexdigest()[:12]
+    script_dir = os.path.join(project_root, "addons", "synty_importer", "generated_material_scripts")
+    os.makedirs(script_dir, exist_ok=True)
+    script_path = os.path.join(script_dir, f"{fbx_stem}_{path_tag}.gd")
+    lines: List[str] = [
+        "@tool",
+        "extends EditorScenePostImport",
+        "",
+        "func _post_import(scene: Node) -> Node:",
+    ]
+    first_node = True
+    for node_name in sorted(overrides):
+        safe_name = json.dumps(node_name)
+        declaration = "var target_node" if first_node else "target_node"
+        lines.append(f"    {declaration} = _find_unique_node(scene, {safe_name})")
+        lines.append("    if target_node is MeshInstance3D:")
+        for surface_index in sorted(overrides[node_name]):
+            material_path = json.dumps(overrides[node_name][surface_index])
+            lines.append(
+                f"        target_node.set_surface_override_material({surface_index}, load({material_path}))"
+            )
+        first_node = False
+    lines.extend([
+        "    return scene",
+        "",
+        "func _find_unique_node(root: Node, wanted_name: String) -> Node:",
+        "    var matches: Array[Node] = []",
+        "    _collect_named_nodes(root, wanted_name, matches)",
+        "    return matches[0] if matches.size() == 1 else null",
+        "",
+        "func _collect_named_nodes(",
+        "        node: Node, wanted_name: String, matches: Array[Node]",
+        ") -> void:",
+        "    if node.name == wanted_name:",
+        "        matches.append(node)",
+        "    for child in node.get_children():",
+        "        _collect_named_nodes(child, wanted_name, matches)",
+        "",
+    ])
+    with open(script_path, "w", encoding="utf-8") as out:
+        out.write("\n".join(lines))
+    return "res://" + os.path.relpath(script_path, project_root).replace("\\", "/")
+
+
+def parse_unity_prefab_material_arrays(raw_yaml: str) -> Optional[List[str]]:
+    """Return one safe renderer array, or None when renderer arrays differ."""
+    arrays = []
+    for block in re.finditer(
+        r"m_Materials:\s*\n((?:\s*-\s*\{fileID:[^\}]+\}\s*\n?)+)",
+        raw_yaml,
+    ):
+        slots = []
+        for item in re.findall(r"^\s*-\s*\{([^\n]+)\}", block.group(1), re.M):
+            guid = re.search(r"guid:\s*([a-f0-9]{32})", item)
+            slots.append(guid.group(1) if guid else "")
+        arrays.append(slots)
+    if not arrays:
+        return []
+    first = arrays[0]
+    return first if all(slots == first for slots in arrays[1:]) else None
+
+
 def synchronize_unitypackage_materials(
     project_root: str,
     categorized_files: Dict[str, List[str]]
-) -> Tuple[int, Dict[str, Dict[str, List[str]]]]:
+) -> Tuple[int, Dict[str, Any]]:
     updated_mats = 0
-    pack_prefab_mats: Dict[str, Dict[str, List[str]]] = {}
+    pack_prefab_mats: Dict[str, Any] = {}
+    pack_prefab_contexts: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
     def add_prefab_mats(pack_key: str, model_key: str, mats: List[str]) -> None:
         norm_pack = os.path.normpath(pack_key)
@@ -804,19 +1201,22 @@ def synchronize_unitypackage_materials(
                 raw_yaml = guid_to_asset[guid].decode("utf-8", errors="ignore")
                 pack_dir = get_pack_root(os.path.normpath(os.path.join(project_root, rel_path)))
 
-                mat_paths = []
-                for block in re.finditer(r"m_Materials:\s*\n((?:\s*-\s*\{fileID:[^\}]+\}\s*\n?)+)", raw_yaml):
-                    for mg in re.findall(r"guid:\s*([a-f0-9]{32})", block.group(1)):
-                        res_p = mat_guid_to_res.get(mg)
-                        if not res_p:
-                            mp = guid_to_path.get(mg)
-                            if mp and mp.endswith(".mat"):
-                                res_p = "res://" + mp.replace("\\", "/") + ".tres"
-                        if res_p:
-                            clean_p = res_p if res_p.endswith(".tres") else res_p + ".tres"
-                            mat_paths.append(clean_p)
+                prefab_guids = parse_unity_prefab_material_arrays(raw_yaml)
+                mat_paths = [] if prefab_guids is None else []
+                for mg in prefab_guids or []:
+                    res_p = mat_guid_to_res.get(mg)
+                    if not res_p:
+                        mp = guid_to_path.get(mg)
+                        if mp and mp.endswith(".mat"):
+                            res_p = "res://" + mp.replace("\\", "/") + ".tres"
+                    clean_p = res_p if res_p and res_p.endswith(".tres") else (res_p + ".tres" if res_p else "")
+                    mat_paths.append(clean_p)
 
-                for block in re.finditer(r"propertyPath:\s*m_Materials\.Array\.data\[(\d+)\]\s*\n\s*value:\s*\n\s*objectReference:\s*\{fileID:[^,]+,\s*guid:\s*([a-f0-9]{32})", raw_yaml):
+                if prefab_guids is None:
+                    property_blocks = []
+                else:
+                    property_blocks = re.finditer(r"propertyPath:\s*m_Materials\.Array\.data\[(\d+)\]\s*\n\s*value:\s*\n\s*objectReference:\s*\{fileID:[^,]+,\s*guid:\s*([a-f0-9]{32})", raw_yaml)
+                for block in property_blocks:
                     idx, mg = int(block.group(1)), block.group(2)
                     res_p = mat_guid_to_res.get(mg)
                     if not res_p:
@@ -826,7 +1226,11 @@ def synchronize_unitypackage_materials(
                     if res_p:
                         clean_p = res_p if res_p.endswith(".tres") else res_p + ".tres"
                         while len(mat_paths) <= idx:
-                            mat_paths.append(clean_p)
+                            # An indexed override does not imply that the
+                            # intervening Unity slots contain this material.
+                            # Preserve positional holes until the override is
+                            # applied at its explicit index.
+                            mat_paths.append("")
                         mat_paths[idx] = clean_p
 
                 if mat_paths:
@@ -838,6 +1242,34 @@ def synchronize_unitypackage_materials(
                             add_prefab_mats(pack_dir, model_stem, mat_paths)
                     prefab_stem = os.path.splitext(os.path.basename(rel_path))[0].lower()
                     add_prefab_mats(pack_dir, prefab_stem, mat_paths)
+                    contexts = []
+                    for context in parse_unity_prefab_renderer_contexts(raw_yaml):
+                        context = dict(context)
+                        resolved_context_materials = []
+                        for material_guid in context["materials"]:
+                            material_path = mat_guid_to_res.get(material_guid, "") if material_guid else ""
+                            if not material_path and material_guid:
+                                material_rel_path = guid_to_path.get(material_guid, "")
+                                if material_rel_path.endswith(".mat"):
+                                    material_path = "res://" + material_rel_path.replace("\\", "/") + ".tres"
+                            # Preserve Unity's array indices, including null slots.
+                            resolved_context_materials.append(material_path)
+                        context["materials"] = resolved_context_materials
+                        contexts.append(context)
+                    if contexts:
+                        context_map = pack_prefab_contexts.setdefault(os.path.normpath(pack_dir), {})
+                        for context in contexts:
+                            context["prefab_stem"] = prefab_stem
+                            context["prefab_path"] = rel_path.replace("\\", "/")
+                        context_map.setdefault(prefab_stem, []).extend(contexts)
+                        # A Unity prefab name and its FBX filename do not have
+                        # to match. Index the same renderer contexts by the
+                        # source mesh stem as a stable cross-format identity.
+                        for context in contexts:
+                            mesh_rel_path = guid_to_path.get(context.get("mesh_guid", ""), "")
+                            mesh_stem = os.path.splitext(os.path.basename(mesh_rel_path))[0].lower()
+                            if mesh_stem and mesh_stem != prefab_stem:
+                                context_map.setdefault(mesh_stem, []).append(context)
 
     # 2. Synchronize standalone on-disk .mat files
     for mpath in categorized_files.get("materials", []):
@@ -903,6 +1335,7 @@ def synchronize_unitypackage_materials(
                                 pass
                             break
 
+    pack_prefab_mats["__renderer_contexts__"] = pack_prefab_contexts
     return updated_mats, pack_prefab_mats
 
 
@@ -916,10 +1349,10 @@ def resolve_slot_material(
     slot_index: int = 0
 ) -> str:
     res = ""
-    if prefab_mats and len(prefab_mats) > 0:
+    if prefab_mats is not None:
         # Unity's renderer material array is positional. Preserve duplicate
         # entries so FBX slots and Unity submesh slots stay aligned.
-        res = prefab_mats[slot_index] if slot_index < len(prefab_mats) else prefab_mats[0]
+        res = prefab_mats[slot_index] if slot_index < len(prefab_mats) else ""
     else:
         skip_sfx = ("_normal", "_normals", "_n", "_emissive", "_emission", "emissive", "emission", "_occlusion", "_ao", "_mask", "_alpha")
         diffuse_candidates = [t for t in connected_tex if not any(sfx in os.path.basename(t).lower() for sfx in skip_sfx)]
@@ -1020,6 +1453,8 @@ def map_all_fbx_materials(
         pref_mats = pack_prefab_mats.get(pack_dir, {}).get(model_stem)
         if not pref_mats:
             for p_key, p_dict in pack_prefab_mats.items():
+                if p_key == "__renderer_contexts__":
+                    continue
                 if model_stem in p_dict:
                     pref_mats = p_dict[model_stem]
                     break
@@ -1108,6 +1543,43 @@ fbx/naming_version=1
                     "use_external/path": res_mat
                 }
 
+        # Keep the existing FBX-wide mapping as the default.  Only add a
+        # post-import node/surface override when Unity proves that a shared
+        # FBX material is assigned differently on a specific renderer.
+        contextual_script = ""
+        renderer_contexts = pack_prefab_mats.get("__renderer_contexts__", {}).get(pack_dir, {}).get(model_stem, [])
+        if renderer_contexts:
+            # A source mesh can be reused by multiple Unity prefabs. Do not
+            # merge their renderer assignments into one FBX import. The
+            # contextual path is safe only when exactly one prefab identity is
+            # represented by the candidate contexts.
+            prefab_ids = {
+                context.get("prefab_path") or context.get("prefab_stem", "")
+                for context in renderer_contexts
+            }
+            if len(prefab_ids - {""}) > 1:
+                renderer_contexts = []
+        if renderer_contexts and g.get("model_materials"):
+            fallback_materials = {name: entry["use_external/path"] for name, entry in mat_dict.items()}
+            material_resources = {
+                path: path
+                for context in renderer_contexts
+                for path in context.get("materials", [])
+                if path
+            }
+            contextual_overrides = build_contextual_material_overrides(
+                g, renderer_contexts, fallback_materials, material_resources
+            )
+            contextual_script = generate_contextual_import_script(
+                project_root, fbx_path, contextual_overrides
+            )
+            existing_script = re.search(r'import_script/path="([^"]*)"', content)
+            if existing_script and existing_script.group(1) and "generated_material_scripts/" not in existing_script.group(1):
+                # Do not overwrite a user-authored import script. The
+                # contextual assignment is optional and must not replace
+                # unrelated importer behavior.
+                contextual_script = ""
+
         nodes_match = re.search(r'("nodes":\s*\{[\s\S]*?\n\s*\})', content)
         nodes_block = nodes_match.group(1) if nodes_match else None
         meshes_match = re.search(r'("meshes":\s*\{[\s\S]*?\n\s*\})', content)
@@ -1148,6 +1620,28 @@ fbx/naming_version=1
                 content = content[:params_idx + 8] + "\nfbx/importer=0\nfbx/embedded_image_handling=0\nmaterials/extract=0" + content[params_idx + 8:]
             else:
                 content += "\nfbx/importer=0\nfbx/embedded_image_handling=0\nmaterials/extract=0\n"
+
+        if contextual_script:
+            script_line = f'import_script/path="{contextual_script}"'
+            if re.search(r'import_script/path="[^"]*"', content):
+                content = re.sub(
+                    r'import_script/path="[^"]*"',
+                    script_line,
+                    content,
+                    count=1,
+                )
+            else:
+                params_idx = content.find("[params]")
+                if params_idx != -1:
+                    insert_at = content.find("\n", params_idx)
+                    if insert_at == -1:
+                        content += "\n" + script_line + "\n"
+                    else:
+                        content = content[:insert_at + 1] + script_line + "\n" + content[insert_at + 1:]
+                else:
+                    content += "\n[params]\n" + script_line + "\n"
+        else:
+            content = re.sub(r'\n?import_script/path="[^"]*"', "", content, count=1)
 
         with open(imp_path, "w", encoding="utf-8") as out:
             out.write(content)
