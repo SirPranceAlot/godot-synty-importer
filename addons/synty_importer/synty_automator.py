@@ -30,7 +30,12 @@ import sys
 import tarfile
 import zlib
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import PureWindowsPath
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+
+
+WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:[\\\\/]")
+UNC_PATH_PREFIXES = ("//", "\\\\")
 
 try:
     from PIL import Image
@@ -183,6 +188,40 @@ def read_unitypackage_data(package_path: str) -> Tuple[Dict[str, str], Dict[str,
     except Exception as exc:
         fail_warn(f"Failed to read package {package_path}: {exc}")
     return guid_to_path, guid_to_asset
+
+
+def resolve_package_path(project_root: str, package_path: str) -> Optional[str]:
+    """Return a package path inside the project, or None if it escapes."""
+    normalized_path = package_path.replace("\\", "/")
+    clean_path = normalized_path.lstrip("/")
+    if (
+        os.path.isabs(package_path)
+        or WINDOWS_ABSOLUTE_PATH.match(package_path)
+        or normalized_path.startswith(UNC_PATH_PREFIXES)
+        or not clean_path
+    ):
+        return None
+    clean_path = str(PureWindowsPath(clean_path)).replace("\\", "/")
+    if clean_path == "." or clean_path.startswith("../"):
+        return None
+
+    root = os.path.realpath(project_root)
+    candidate = os.path.realpath(os.path.join(root, clean_path))
+    try:
+        if os.path.commonpath((root, candidate)) != root:
+            return None
+    except ValueError:
+        return None
+    return candidate
+
+
+def package_res_path(project_root: str, package_path: str) -> Optional[str]:
+    """Convert a safe package-relative path into a project resource path."""
+    resolved = resolve_package_path(project_root, package_path)
+    if resolved is None:
+        return None
+    relative = os.path.relpath(resolved, os.path.realpath(project_root))
+    return "res://" + relative.replace("\\", "/")
 
 
 def extract_unitypackage(package_path: str, destination_root: str) -> int:
@@ -1178,8 +1217,12 @@ def synchronize_unitypackage_materials(
                 mat_stem = os.path.splitext(os.path.basename(rel_path))[0]
                 pack_dir = get_pack_root(os.path.normpath(os.path.join(project_root, rel_path)))
 
-                target_mat = os.path.join(project_root, rel_path + ".tres")
-                if not os.path.exists(os.path.join(project_root, rel_path)):
+                package_mat_path = resolve_package_path(project_root, rel_path)
+                if package_mat_path is None:
+                    fail_warn(f"Skipping unsafe package material path: {rel_path}")
+                    continue
+                target_mat = package_mat_path + ".tres"
+                if not os.path.exists(package_mat_path):
                     rel_clean = rel_path.replace("\\", "/").lstrip("/")
                     parts = rel_clean.split("/")
                     mat_idx = -1
@@ -1191,7 +1234,13 @@ def synchronize_unitypackage_materials(
                         mat_sub = "/".join(parts[mat_idx:])
                         target_mat = os.path.join(pack_dir, mat_sub + ".tres")
 
-                res_p = "res://" + os.path.relpath(target_mat, project_root).replace("\\", "/")
+                res_p = package_res_path(
+                    project_root,
+                    os.path.relpath(target_mat, project_root),
+                )
+                if res_p is None:
+                    fail_warn(f"Skipping unsafe generated material path: {target_mat}")
+                    continue
                 mat_guid_to_res[guid] = res_p
 
                 atlas_fallback = pack_atlases.get(pack_dir) or global_default_atlas
@@ -1217,7 +1266,9 @@ def synchronize_unitypackage_materials(
                     if not res_p:
                         mp = guid_to_path.get(mg)
                         if mp and mp.endswith(".mat"):
-                            res_p = "res://" + mp.replace("\\", "/") + ".tres"
+                            res_p = package_res_path(project_root, mp)
+                            if res_p:
+                                res_p += ".tres"
                     clean_p = res_p if res_p and res_p.endswith(".tres") else (res_p + ".tres" if res_p else "")
                     mat_paths.append(clean_p)
 
@@ -1231,7 +1282,9 @@ def synchronize_unitypackage_materials(
                     if not res_p:
                         mp = guid_to_path.get(mg)
                         if mp and mp.endswith(".mat"):
-                            res_p = "res://" + mp.replace("\\", "/") + ".tres"
+                            res_p = package_res_path(project_root, mp)
+                            if res_p:
+                                res_p += ".tres"
                     if res_p:
                         clean_p = res_p if res_p.endswith(".tres") else res_p + ".tres"
                         while len(mat_paths) <= idx:

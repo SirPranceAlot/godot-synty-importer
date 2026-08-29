@@ -228,6 +228,17 @@ MeshRenderer:
     assert automator.parse_unity_prefab_material_arrays(raw) == ["", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
 
 
+def test_package_paths_reject_traversal_and_absolute_paths():
+    with tempfile.TemporaryDirectory() as root:
+        assert automator.resolve_package_path(root, "../outside.mat") is None
+        assert automator.resolve_package_path(root, "/outside.mat") is None
+        assert automator.resolve_package_path(root, "C:/outside.mat") is None
+        assert automator.package_res_path(root, "../outside.mat") is None
+        assert automator.package_res_path(root, "Materials/inside.mat") == (
+            "res://Materials/inside.mat"
+        )
+
+
 def test_null_material_path_normalization_keeps_placeholder():
     assert automator.normalize_prefab_material_paths(["", "res://mat.tres"])
     assert automator.normalize_prefab_material_paths(["", "res://mat.tres"]) == [
