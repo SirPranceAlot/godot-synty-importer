@@ -1392,7 +1392,7 @@ def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[st
             # Stripped prefab-root Transform records are serialized after the
             # corresponding PrefabInstance block. Index them globally before
             # splitting blocks so root overrides can be matched reliably.
-            stripped_roots: Dict[str, str] = {}
+            stripped_roots: Dict[str, List[str]] = {}
             for stripped_m in re.finditer(
                 r"--- !u!4 &[^\n]+ stripped\nTransform:\n"
                 r"\s*m_CorrespondingSourceObject:\s*\{fileID:\s*([^,}]+).*?\n"
@@ -1400,7 +1400,7 @@ def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[st
                 raw,
                 re.S,
             ):
-                stripped_roots[stripped_m.group(2)] = stripped_m.group(1).strip()
+                stripped_roots.setdefault(stripped_m.group(2), []).append(stripped_m.group(1).strip())
 
             blocks = raw.split("--- !u!1001 &")
             if len(blocks) <= 1:
@@ -1437,26 +1437,37 @@ def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[st
                 # objects in one list. The stripped Transform record identifies
                 # the actual prefab-root source file ID.
                 instance_id = lines[0].strip() if lines else ""
-                root_source_id = stripped_roots.get(instance_id)
+                # Each override property repeats its target record, so
+                # accumulate paths by target ID before selecting the prefab
+                # root. Multiple stripped transforms can share one instance
+                # ID; prefer the candidate carrying m_RootOrder, which Unity
+                # serializes on the instance root, and never overwrite it.
+                target_paths_by_id: Dict[str, Set[str]] = {}
+                current_target = None
+                for line in lines:
+                    target_m = re.search(r"- target:\s*\{fileID:\s*([^,}]+)", line)
+                    if target_m:
+                        current_target = target_m.group(1).strip()
+                    path_m = re.search(r"propertyPath:\s*(\S+)", line)
+                    if current_target and path_m:
+                        target_paths_by_id.setdefault(current_target, set()).add(path_m.group(1))
 
-                if root_source_id == "0":
-                    root_source_id = None
+                root_source_id = None
+                stripped_candidates = stripped_roots.get(instance_id, [])
+                transform_paths = {"m_LocalPosition.x", "m_LocalRotation.w"}
+                for candidate_id in stripped_candidates:
+                    candidate_paths = target_paths_by_id.get(candidate_id, set())
+                    if "m_RootOrder" in candidate_paths and transform_paths.issubset(candidate_paths):
+                        root_source_id = candidate_id
+                        break
                 if root_source_id is None:
-                    # Each override property repeats its target record, so do
-                    # not look for position and rotation fields in one target
-                    # block. Accumulate paths by target ID, then select the
-                    # target carrying the prefab-root transform override.
-                    target_paths_by_id: Dict[str, Set[str]] = {}
-                    current_target = None
-                    for line in lines:
-                        target_m = re.search(r"- target:\s*\{fileID:\s*([^,}]+)", line)
-                        if target_m:
-                            current_target = target_m.group(1).strip()
-                        path_m = re.search(r"propertyPath:\s*(\S+)", line)
-                        if current_target and path_m:
-                            target_paths_by_id.setdefault(current_target, set()).add(path_m.group(1))
+                    for candidate_id in stripped_candidates:
+                        if transform_paths.issubset(target_paths_by_id.get(candidate_id, set())):
+                            root_source_id = candidate_id
+                            break
+                if root_source_id is None:
                     for candidate_id, candidate_paths in target_paths_by_id.items():
-                        if {"m_LocalPosition.x", "m_LocalRotation.w"}.issubset(candidate_paths):
+                        if transform_paths.issubset(candidate_paths):
                             root_source_id = candidate_id
                             break
                 current_target = None
