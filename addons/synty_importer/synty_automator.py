@@ -681,16 +681,23 @@ def parse_fbx_graph(file_path: str) -> Dict[str, Any]:
 
     connections_node = next((n for n in root if n[0] == "Connections"), None)
     mat_to_textures: Dict[int, List[str]] = {}
+    texture_videos: Dict[int, List[str]] = {}
     if connections_node:
-        for c in connections_node[2]:
-            c_props = c[1]
-            if len(c_props) >= 3 and c_props[0] == "OO":
-                child_id, parent_id = c_props[1], c_props[2]
-                if parent_id in materials and child_id in textures:
-                    tname, tfname = textures[child_id]
-                    vfname = videos.get(child_id, "")
-                    final_path = tfname or vfname or tname
-                    mat_to_textures.setdefault(parent_id, []).append(final_path)
+        connections = [c[1] for c in connections_node[2] if len(c[1]) >= 3]
+        # FBX stores the Video -> Texture edge separately from the
+        # Texture -> Material edge, and the edges are not ordered. Resolve
+        # the first edge set before resolving material texture assignments.
+        for c_props in connections:
+            kind, child_id, parent_id = c_props[:3]
+            if kind == "OO" and parent_id in textures and child_id in videos:
+                texture_videos.setdefault(parent_id, []).append(videos[child_id])
+        for c_props in connections:
+            kind, child_id, parent_id = c_props[:3]
+            if kind in ("OO", "OP") and parent_id in materials and child_id in textures:
+                tname, tfname = textures[child_id]
+                linked_videos = texture_videos.get(child_id, [])
+                final_path = (linked_videos[0] if linked_videos else tfname) or tname
+                mat_to_textures.setdefault(parent_id, []).append(final_path)
 
     slot_to_tex: Dict[str, List[str]] = {}
     for mid, mname in materials.items():
@@ -718,11 +725,14 @@ def synchronize_unitypackage_materials(
     def add_prefab_mats(pack_key: str, model_key: str, mats: List[str]) -> None:
         norm_pack = os.path.normpath(pack_key)
         pack_dict = pack_prefab_mats.setdefault(norm_pack, {})
+        clean_mats = [m if m.endswith(".tres") else m + ".tres" for m in mats]
         existing = pack_dict.setdefault(model_key, [])
-        for m in mats:
-            clean_m = m if m.endswith(".tres") else m + ".tres"
-            if clean_m not in existing:
-                existing.append(clean_m)
+        # Preserve renderer-slot duplicates: FBX material slots are positional.
+        # Repeated calls for the same prefab/mesh must not concatenate copies.
+        if not existing:
+            existing.extend(clean_mats)
+        elif existing != clean_mats:
+            return
 
     # Build global guid_to_path from all packages
     global_guid_to_path: Dict[str, str] = {}
@@ -907,10 +917,9 @@ def resolve_slot_material(
 ) -> str:
     res = ""
     if prefab_mats and len(prefab_mats) > 0:
-        if slot_index < len(prefab_mats):
-            res = prefab_mats[slot_index]
-        else:
-            res = prefab_mats[0]
+        # Unity's renderer material array is positional. Preserve duplicate
+        # entries so FBX slots and Unity submesh slots stay aligned.
+        res = prefab_mats[slot_index] if slot_index < len(prefab_mats) else prefab_mats[0]
     else:
         skip_sfx = ("_normal", "_normals", "_n", "_emissive", "_emission", "emissive", "emission", "_occlusion", "_ao", "_mask", "_alpha")
         diffuse_candidates = [t for t in connected_tex if not any(sfx in os.path.basename(t).lower() for sfx in skip_sfx)]
@@ -1380,6 +1389,19 @@ def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[st
                 p_pos, p_rot, p_scale = get_world_transform(t["father"], visited)
                 return combine_transforms(p_pos, p_rot, p_scale, t["pos"], t["rot"], t["scale"])
 
+            # Stripped prefab-root Transform records are serialized after the
+            # corresponding PrefabInstance block. Index them globally before
+            # splitting blocks so root overrides can be matched reliably.
+            stripped_roots: Dict[str, str] = {}
+            for stripped_m in re.finditer(
+                r"--- !u!4 &[^\n]+ stripped\nTransform:\n"
+                r"\s*m_CorrespondingSourceObject:\s*\{fileID:\s*([^,}]+).*?\n"
+                r"\s*m_PrefabInstance:\s*\{fileID:\s*(\d+)\}",
+                raw,
+                re.S,
+            ):
+                stripped_roots[stripped_m.group(2)] = stripped_m.group(1).strip()
+
             blocks = raw.split("--- !u!1001 &")
             if len(blocks) <= 1:
                 continue
@@ -1415,32 +1437,28 @@ def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[st
                 # objects in one list. The stripped Transform record identifies
                 # the actual prefab-root source file ID.
                 instance_id = lines[0].strip() if lines else ""
-                root_source_m = re.search(
-                    rf"--- !u!4 &[^\n]+ stripped\nTransform:\n"
-                    rf"\s*m_CorrespondingSourceObject:\s*\{{fileID:\s*([^,}}]+).*?\n"
-                    rf"\s*m_PrefabInstance:\s*\{{fileID:\s*{re.escape(instance_id)}\}}",
-                    b,
-                    re.S,
-                )
-                root_source_id = root_source_m.group(1).strip() if root_source_m else None
+                root_source_id = stripped_roots.get(instance_id)
+
                 if root_source_id == "0":
                     root_source_id = None
                 if root_source_id is None:
-                    target_id = None
-                    target_paths: Set[str] = set()
+                    # Each override property repeats its target record, so do
+                    # not look for position and rotation fields in one target
+                    # block. Accumulate paths by target ID, then select the
+                    # target carrying the prefab-root transform override.
+                    target_paths_by_id: Dict[str, Set[str]] = {}
+                    current_target = None
                     for line in lines:
                         target_m = re.search(r"- target:\s*\{fileID:\s*([^,}]+)", line)
                         if target_m:
-                            if {"m_LocalPosition.x", "m_LocalRotation.w"}.issubset(target_paths):
-                                root_source_id = target_id
-                                break
-                            target_id = target_m.group(1).strip()
-                            target_paths = set()
+                            current_target = target_m.group(1).strip()
                         path_m = re.search(r"propertyPath:\s*(\S+)", line)
-                        if path_m:
-                            target_paths.add(path_m.group(1))
-                    if root_source_id is None and {"m_LocalPosition.x", "m_LocalRotation.w"}.issubset(target_paths):
-                        root_source_id = target_id
+                        if current_target and path_m:
+                            target_paths_by_id.setdefault(current_target, set()).add(path_m.group(1))
+                    for candidate_id, candidate_paths in target_paths_by_id.items():
+                        if {"m_LocalPosition.x", "m_LocalRotation.w"}.issubset(candidate_paths):
+                            root_source_id = candidate_id
+                            break
                 current_target = None
                 for i, line in enumerate(lines):
                     target_m = re.search(r"- target:\s*\{fileID:\s*([^,}]+)", line)
@@ -1511,6 +1529,16 @@ def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[st
                 r"m_AmbientSkyColor:\s*\{r:\s*([\d.eE+-]+),\s*g:\s*([\d.eE+-]+),\s*b:\s*([\d.eE+-]+)",
                 raw
             )
+            equator_m = re.search(
+                r"m_AmbientEquatorColor:\s*\{r:\s*([\d.eE+-]+),\s*g:\s*([\d.eE+-]+),\s*b:\s*([\d.eE+-]+)",
+                raw
+            )
+            ground_m = re.search(
+                r"m_AmbientGroundColor:\s*\{r:\s*([\d.eE+-]+),\s*g:\s*([\d.eE+-]+),\s*b:\s*([\d.eE+-]+)",
+                raw
+            )
+            ambient_intensity_m = re.search(r"m_AmbientIntensity:\s*([\d.eE+-]+)", raw)
+            ambient_mode_m = re.search(r"m_AmbientMode:\s*(\d+)", raw)
             fog_on = re.search(r"^\s*m_Fog:\s*(\d+)", raw, re.M)
             fogcol_m = re.search(
                 r"m_FogColor:\s*\{r:\s*([\d.eE+-]+),\s*g:\s*([\d.eE+-]+),\s*b:\s*([\d.eE+-]+)",
@@ -1521,14 +1549,16 @@ def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[st
             env_lines = []
             if ambient_m:
                 ar, ag, ab_ = float(ambient_m.group(1)), float(ambient_m.group(2)), float(ambient_m.group(3))
+                eqr, eqg, eqb = (float(equator_m.group(i)) for i in (1, 2, 3)) if equator_m else (ar, ag, ab_)
+                gnr, gng, gnb = (float(ground_m.group(i)) for i in (1, 2, 3)) if ground_m else (ar, ag, ab_)
                 if ar + ag + ab_ > 0.01:
                     load_steps += 2  # Environment + ProceduralSkyMaterial
                     sub_resources.append(
                         '[sub_resource type="ProceduralSkyMaterial" id="SkyMat"]\n'
                         f"sky_top_color = Color({ar:.4g}, {ag:.4g}, {ab_:.4g}, 1)\n"
-                        f"sky_horizon_color = Color({ar:.4g}, {ag:.4g}, {ab_:.4g}, 1)\n"
-                        "ground_bottom_color = Color(0.12, 0.12, 0.14, 1)\n"
-                        "ground_horizon_color = Color(0.2, 0.2, 0.22, 1)\n"
+                        f"sky_horizon_color = Color({eqr:.4g}, {eqg:.4g}, {eqb:.4g}, 1)\n"
+                        f"ground_horizon_color = Color({gnr:.4g}, {gng:.4g}, {gnb:.4g}, 1)\n"
+                        f"ground_bottom_color = Color({gnr:.4g}, {gng:.4g}, {gnb:.4g}, 1)\n"
                     )
                     sub_resources.append(
                         '[sub_resource type="Sky" id="Sky"]\n'
@@ -1556,6 +1586,13 @@ def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[st
                 ) if color_m else (1.0, 1.0, 1.0)
                 lrange = float(range_m.group(1)) if range_m else 10.0
                 linten = float(inten_m.group(1)) if inten_m else 1.0
+                enabled_m = re.search(r"m_Enabled:\s*(\d+)", lb)
+                if enabled_m and enabled_m.group(1) == "0":
+                    continue
+                shadow_m = re.search(r"m_Shadows:\s*\n\s*m_Type:\s*(\d+)", lb)
+                shadow_enabled = bool(shadow_m and shadow_m.group(1) != "0")
+                spot_angle_m = re.search(r"m_SpotAngle:\s*([\d.eE+-]+)", lb)
+                spot_angle = float(spot_angle_m.group(1)) if spot_angle_m else 45.0
 
                 # Find the Transform for this light's GameObject
                 l_tf_id = None
@@ -1583,7 +1620,7 @@ def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[st
                         f"light_color = {col_str}",
                         f"light_energy = {energy:.4g}",
                         f"omni_range = {max(0.1, lrange):.6g}",
-                        "shadow_enabled = false",
+                        f"shadow_enabled = {'true' if shadow_enabled else 'false'}",
                     ]
                     light_nodes.append((f"PointLight_{lm.group(1)}", "OmniLight3D", t_str, props))
                 elif ltype == "0":  # Spot -> SpotLight3D
@@ -1591,15 +1628,15 @@ def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[st
                         f"light_color = {col_str}",
                         f"light_energy = {energy:.4g}",
                         f"spot_range = {max(0.1, lrange):.6g}",
-                        "spot_angle = 45.0",
-                        "shadow_enabled = false",
+                        f"spot_angle = {spot_angle:.6g}",
+                        f"shadow_enabled = {'true' if shadow_enabled else 'false'}",
                     ]
                     light_nodes.append((f"SpotLight_{lm.group(1)}", "SpotLight3D", t_str, props))
                 elif ltype == "1":  # Directional -> DirectionalLight3D
                     props = [
                         f"light_color = {col_str}",
                         f"light_energy = {max(0.05, linten * 0.25):.4g}",
-                        "shadow_enabled = false",
+                        f"shadow_enabled = {'true' if shadow_enabled else 'false'}",
                     ]
                     light_nodes.append((f"DirectionalLight_{lm.group(1)}", "DirectionalLight3D", t_str, props))
 
@@ -1655,14 +1692,18 @@ def compile_unity_scenes(project_root: str, categorized_files: Dict[str, List[st
                 continue
 
             if has_env:
+                # Unity 0=Skybox and 1=Trilight both use environment sky data;
+                # Unity 2=Flat and 3=Custom are closest to Godot color ambient light.
+                ambient_mode = int(ambient_mode_m.group(1)) if ambient_mode_m else 0
+                ambient_source = 3 if ambient_mode in (0, 1) else 2
+                ambient_energy = float(ambient_intensity_m.group(1)) if ambient_intensity_m else 1.0
                 env_body = (
                     '[sub_resource type="Environment" id="Env"]\n'
                     "background_mode = 2\n"
-                    "ambient_light_source = 2\n"
+                    f"ambient_light_source = {ambient_source}\n"
                     f"ambient_light_color = Color({ar:.4g}, {ag:.4g}, {ab_:.4g}, 1)\n"
-                    "ambient_light_energy = 1.0\n"
+                    f"ambient_light_energy = {max(0.0, ambient_energy):.6g}\n"
                     "tonemap_mode = 2\n"
-                    "glow_enabled = true\n"
                 )
                 if fog_on and fog_on.group(1) == "1" and fogcol_m:
                     fr, fg_, fb = float(fogcol_m.group(1)), float(fogcol_m.group(2)), float(fogcol_m.group(3))
