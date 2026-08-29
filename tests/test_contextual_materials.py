@@ -3,6 +3,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "addons" / "synty_importer"))
@@ -227,6 +228,22 @@ MeshRenderer:
   - {fileID: 2100000, guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb, type: 2}
 """
     assert automator.parse_unity_prefab_material_arrays(raw) == ["", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+
+
+def test_compressed_fbx_array_limit_is_enforced():
+    original_limit = automator.MAX_FBX_ARRAY_BYTES
+    automator.MAX_FBX_ARRAY_BYTES = 64
+    try:
+        payload = zlib.compress(b"x" * 65)
+        raw = b"b" + struct.pack("<III", 1, 1, len(payload)) + payload
+        try:
+            automator.read_fbx_properties(raw, 0, 1)
+        except struct.error as exc:
+            assert "safety limit" in str(exc)
+        else:
+            raise AssertionError("oversized compressed array was accepted")
+    finally:
+        automator.MAX_FBX_ARRAY_BYTES = original_limit
 
 
 def test_malformed_fbx_returns_empty_graph():

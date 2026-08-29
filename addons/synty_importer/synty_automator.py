@@ -48,6 +48,7 @@ MAX_WORKERS = min(32, (os.cpu_count() or 4) * 4)
 MAX_PACKAGE_MEMBER_BYTES = 256 * 1024 * 1024
 MAX_PACKAGE_TOTAL_BYTES = 1024 * 1024 * 1024
 MAX_PACKAGE_PATH_BYTES = 4096
+MAX_FBX_ARRAY_BYTES = 256 * 1024 * 1024
 
 PNG_1X1_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
@@ -616,56 +617,54 @@ def sanitize_and_resolve_textures(project_root: str, categorized_files: Dict[str
 # 3. Deep FBX Binary Connection Graph Parser
 # ==============================================================================
 def read_fbx_properties(data: bytes, offset: int, num_props: int) -> Tuple[List[Any], int]:
-    props = []
+    props: List[Any] = []
     curr = offset
+
+    def require(size: int) -> None:
+        if size < 0 or curr + size > len(data):
+            raise struct.error("truncated FBX property")
+
     for _ in range(num_props):
-        if curr >= len(data):
-            break
+        require(1)
         type_code = chr(data[curr])
         curr += 1
-        if type_code == 'Y':
-            props.append(struct.unpack("<h", data[curr:curr + 2])[0])
-            curr += 2
-        elif type_code == 'C':
-            props.append(struct.unpack("<?", data[curr:curr + 1])[0])
-            curr += 1
-        elif type_code == 'I':
-            props.append(struct.unpack("<i", data[curr:curr + 4])[0])
+        formats = {"Y": "<h", "C": "<?", "I": "<i", "F": "<f", "D": "<d", "L": "<q"}
+        if type_code in formats:
+            size = struct.calcsize(formats[type_code])
+            require(size)
+            props.append(struct.unpack_from(formats[type_code], data, curr)[0])
+            curr += size
+        elif type_code in ("R", "S"):
+            require(4)
+            length = struct.unpack_from("<I", data, curr)[0]
             curr += 4
-        elif type_code == 'F':
-            props.append(struct.unpack("<f", data[curr:curr + 4])[0])
-            curr += 4
-        elif type_code == 'D':
-            props.append(struct.unpack("<d", data[curr:curr + 8])[0])
-            curr += 8
-        elif type_code == 'L':
-            props.append(struct.unpack("<q", data[curr:curr + 8])[0])
-            curr += 8
-        elif type_code in ('R', 'S'):
-            length = struct.unpack("<I", data[curr:curr + 4])[0]
-            curr += 4
-            val = data[curr:curr + length].decode("utf-8", errors="ignore")
-            props.append(val)
+            require(length)
+            props.append(data[curr:curr + length].decode("utf-8", errors="ignore"))
             curr += length
-        elif type_code in ('f', 'd', 'l', 'i', 'b'):
-            arr_len, enc, comp_len = struct.unpack("<III", data[curr:curr + 12])
+        elif type_code in ("f", "d", "l", "i", "b"):
+            require(12)
+            arr_len, enc, comp_len = struct.unpack_from("<III", data, curr)
             curr += 12
+            fmt = {"f": "f", "d": "d", "l": "q", "i": "i", "b": "b"}[type_code]
+            item_size = struct.calcsize("<" + fmt)
+            unpacked_size = arr_len * item_size
+            if unpacked_size > MAX_FBX_ARRAY_BYTES:
+                raise struct.error("FBX array exceeds safety limit")
+            require(comp_len)
             payload = data[curr:curr + comp_len]
             curr += comp_len
-            values = None
             if enc == 1:
-                try:
-                    payload = zlib.decompress(payload)
-                except zlib.error:
-                    payload = b''
-            if enc in (0, 1):
-                fmt = {'f': 'f', 'd': 'd', 'l': 'q', 'i': 'i', 'b': 'b'}[type_code]
-                size = struct.calcsize('<' + fmt)
-                if len(payload) == arr_len * size:
-                    values = list(struct.unpack('<' + fmt * arr_len, payload))
-            props.append(values)
+                decompressor = zlib.decompressobj()
+                payload = decompressor.decompress(payload, MAX_FBX_ARRAY_BYTES + 1)
+                if len(payload) > MAX_FBX_ARRAY_BYTES or decompressor.unconsumed_tail:
+                    raise struct.error("FBX compressed array exceeds safety limit")
+                payload += decompressor.flush(MAX_FBX_ARRAY_BYTES + 1 - len(payload))
+            if enc in (0, 1) and len(payload) == unpacked_size:
+                props.append(list(struct.unpack("<" + fmt * arr_len, payload)))
+            else:
+                props.append(None)
         else:
-            break
+            raise struct.error(f"unknown FBX property type: {type_code}")
     return props, curr
 
 
@@ -758,7 +757,7 @@ def parse_fbx_graph(file_path: str) -> Dict[str, Any]:
 
     try:
         return _parse_fbx_graph_data(data)
-    except (IndexError, struct.error, ValueError, RecursionError):
+    except (IndexError, struct.error, ValueError, RecursionError, zlib.error):
         fail_warn(f"Failed to parse malformed FBX: {file_path}")
         return {}
 
@@ -768,34 +767,50 @@ def _parse_fbx_graph_data(data: bytes) -> Dict[str, Any]:
     if not data.startswith(b"Kaydara FBX Binary"):
         return {}
 
-    version = struct.unpack("<I", data[23:27])[0]
+    if len(data) < 27:
+        raise struct.error("truncated FBX header")
+    version = struct.unpack_from("<I", data, 23)[0]
     is_64bit = version >= 7500
 
     def parse_node(offset: int):
+        header_size = 25 if is_64bit else 13
+        if offset < 0 or offset + header_size > len(data):
+            raise struct.error("truncated FBX node header")
         if is_64bit:
-            if offset + 25 > len(data):
-                return None, len(data)
-            end_offset, num_props, prop_len, name_len = struct.unpack("<QQQB", data[offset:offset + 25])
-            header_size = 25
+            end_offset, num_props, prop_len, name_len = struct.unpack_from(
+                "<QQQB", data, offset
+            )
         else:
-            if offset + 13 > len(data):
-                return None, len(data)
-            end_offset, num_props, prop_len, name_len = struct.unpack("<IIIB", data[offset:offset + 13])
-            header_size = 13
+            end_offset, num_props, prop_len, name_len = struct.unpack_from(
+                "<IIIB", data, offset
+            )
         if end_offset == 0:
             return None, offset + header_size
-        name = data[offset + header_size:offset + header_size + name_len].decode("ascii", errors="ignore")
-        prop_offset = offset + header_size + name_len
-        props, _ = read_fbx_properties(data, prop_offset, num_props)
+        name_offset = offset + header_size
+        prop_offset = name_offset + name_len
         child_offset = prop_offset + prop_len
+        if (
+            end_offset > len(data)
+            or name_offset > len(data)
+            or prop_offset > end_offset
+            or child_offset > end_offset
+            or child_offset < prop_offset
+        ):
+            raise struct.error("invalid FBX node bounds")
+        name = data[name_offset:prop_offset].decode("ascii", errors="ignore")
+        props, parsed_end = read_fbx_properties(data, prop_offset, num_props)
+        if parsed_end > child_offset:
+            raise struct.error("FBX properties exceed node bounds")
         children = []
         while child_offset < end_offset:
             child, next_off = parse_node(child_offset)
-            if child:
-                children.append(child)
+            if next_off <= child_offset:
+                raise struct.error("invalid FBX child progress")
+            if child is None:
                 child_offset = next_off
-            else:
                 break
+            children.append(child)
+            child_offset = next_off
         return (name, props, children), end_offset
 
     root = []
