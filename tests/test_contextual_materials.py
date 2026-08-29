@@ -1,4 +1,5 @@
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -226,6 +227,15 @@ MeshRenderer:
   - {fileID: 2100000, guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb, type: 2}
 """
     assert automator.parse_unity_prefab_material_arrays(raw) == ["", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+
+
+def test_malformed_fbx_returns_empty_graph():
+    with tempfile.TemporaryDirectory() as root:
+        path = Path(root, "broken.fbx")
+        header = b"Kaydara FBX Binary  \x00\x1a\x00"
+        header += struct.pack("<I", 7400)
+        path.write_bytes(header + struct.pack("<IIIB", 40, 1, 1, 0) + b"I")
+        assert automator.parse_fbx_graph(str(path)) == {}
 
 
 def test_package_paths_reject_traversal_and_absolute_paths():

@@ -45,6 +45,9 @@ except ImportError:
 
 IGNORED_DIRS = {".godot", ".git", "node_modules", ".import"}
 MAX_WORKERS = min(32, (os.cpu_count() or 4) * 4)
+MAX_PACKAGE_MEMBER_BYTES = 256 * 1024 * 1024
+MAX_PACKAGE_TOTAL_BYTES = 1024 * 1024 * 1024
+MAX_PACKAGE_PATH_BYTES = 4096
 
 PNG_1X1_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
@@ -180,11 +183,25 @@ def read_unitypackage_data(package_path: str) -> Tuple[Dict[str, str], Dict[str,
                         if kind in ("pathname", "asset"):
                             f = tar.extractfile(member)
                             if f:
-                                content = f.read()
+                                if member.size < 0 or member.size > MAX_PACKAGE_MEMBER_BYTES:
+                                    fail_warn(f"Skipping oversized package member: {member.name}")
+                                    continue
+                                content = f.read(MAX_PACKAGE_MEMBER_BYTES + 1)
+                                if len(content) > MAX_PACKAGE_MEMBER_BYTES:
+                                    fail_warn(f"Skipping oversized package member: {member.name}")
+                                    continue
                                 if kind == "pathname":
-                                    guid_to_path[guid] = content.decode("utf-8", errors="ignore").splitlines()[0].strip()
+                                    if len(content) > MAX_PACKAGE_PATH_BYTES:
+                                        fail_warn(f"Skipping oversized pathname member: {member.name}")
+                                        continue
+                                    lines = content.decode("utf-8", errors="ignore").splitlines()
+                                    if lines and lines[0].strip():
+                                        guid_to_path[guid] = lines[0].strip()
                                 elif kind == "asset":
                                     guid_to_asset[guid] = content
+                                if sum(len(asset) for asset in guid_to_asset.values()) > MAX_PACKAGE_TOTAL_BYTES:
+                                    fail_warn(f"Package asset data exceeds safety limit: {package_path}")
+                                    break
     except Exception as exc:
         fail_warn(f"Failed to read package {package_path}: {exc}")
     return guid_to_path, guid_to_asset
@@ -738,6 +755,15 @@ def parse_fbx_graph(file_path: str) -> Dict[str, Any]:
             data = fh.read()
     except Exception:
         return {}
+
+    try:
+        return _parse_fbx_graph_data(data)
+    except (IndexError, struct.error, ValueError, RecursionError):
+        fail_warn(f"Failed to parse malformed FBX: {file_path}")
+        return {}
+
+
+def _parse_fbx_graph_data(data: bytes) -> Dict[str, Any]:
 
     if not data.startswith(b"Kaydara FBX Binary"):
         return {}
