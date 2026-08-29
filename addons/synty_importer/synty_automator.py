@@ -1111,6 +1111,15 @@ def parse_unity_prefab_material_arrays(raw_yaml: str) -> Optional[List[str]]:
     return first if all(slots == first for slots in arrays[1:]) else None
 
 
+def normalize_prefab_material_paths(materials: List[str]) -> List[str]:
+    """Normalize material resources without turning null slots into paths."""
+    return [
+        material if not material or material.endswith(".tres")
+        else material + ".tres"
+        for material in materials
+    ]
+
+
 def synchronize_unitypackage_materials(
     project_root: str,
     categorized_files: Dict[str, List[str]]
@@ -1122,7 +1131,7 @@ def synchronize_unitypackage_materials(
     def add_prefab_mats(pack_key: str, model_key: str, mats: List[str]) -> None:
         norm_pack = os.path.normpath(pack_key)
         pack_dict = pack_prefab_mats.setdefault(norm_pack, {})
-        clean_mats = [m if m.endswith(".tres") else m + ".tres" for m in mats]
+        clean_mats = normalize_prefab_material_paths(mats)
         existing = pack_dict.setdefault(model_key, [])
         # Preserve renderer-slot duplicates: FBX material slots are positional.
         # Repeated calls for the same prefab/mesh must not concatenate copies.
@@ -1641,7 +1650,17 @@ fbx/naming_version=1
                 else:
                     content += "\n[params]\n" + script_line + "\n"
         else:
-            content = re.sub(r'\n?import_script/path="[^"]*"', "", content, count=1)
+            existing_script = re.search(r'import_script/path="([^"]*)"', content)
+            if (
+                existing_script
+                and "generated_material_scripts/" in existing_script.group(1)
+            ):
+                content = re.sub(
+                    r'\n?import_script/path="[^"]*"',
+                    "",
+                    content,
+                    count=1,
+                )
 
         with open(imp_path, "w", encoding="utf-8") as out:
             out.write(content)

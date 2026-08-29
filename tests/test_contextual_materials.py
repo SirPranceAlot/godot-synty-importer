@@ -228,6 +228,13 @@ MeshRenderer:
     assert automator.parse_unity_prefab_material_arrays(raw) == ["", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
 
 
+def test_null_material_path_normalization_keeps_placeholder():
+    assert automator.normalize_prefab_material_paths(["", "res://mat.tres"])
+    assert automator.normalize_prefab_material_paths(["", "res://mat.tres"]) == [
+        "", "res://mat.tres"
+    ]
+
+
 def test_null_material_keeps_positional_slot():
     raw = """--- !u!1 &10
 GameObject:
