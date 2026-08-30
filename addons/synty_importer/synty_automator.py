@@ -1191,6 +1191,64 @@ def parse_unity_prefab_material_arrays(raw_yaml: str) -> Optional[List[str]]:
     return first if all(slots == first for slots in arrays[1:]) else None
 
 
+def parse_unity_prefab_renderer_material_groups(raw_yaml: str) -> List[List[str]]:
+    """Return per-renderer material GUID lists from a prefab's property overrides.
+
+    Unity prefabs that reference a shared FBX (a body plus child renderers such
+    as glass frames, shutters, ceilings) often assign materials through
+    PrefabInstance modification entries of the form::
+
+        - target: {fileID: <renderer>, guid: <prefab>, type: 3}
+          propertyPath: m_Materials.Array.data[i]
+          value:
+          objectReference: {fileID: 2100000, guid: <material>, type: 2}
+
+    Each *renderer* owns its own positional material array. Multiple renderers
+    each start their array at index 0, so flattening them into a single
+    index-keyed list lets a later child renderer silently overwrite a
+    body renderer's slot (e.g. a cockpit body's floor panel being replaced by
+    a shared child material). Grouping by the targeted renderer fileID preserves
+    each renderer's array so the body's slots are not clobbered.
+
+    Returns one ordered material-GUID list per targeted renderer (in encounter
+    order). This deliberately does not merge arrays; the caller picks the
+    primary (usually longest) renderer whose per-slot order matches the FBX.
+    """
+    # key: renderer source fileID -> {slot_index: material guid}
+    renderer_slots: Dict[str, Dict[int, str]] = {}
+    # Find the targeted renderer fileID that owns a material array override.
+    # Overrides appear as target blocks; the material property immediately follows.
+    for block in re.finditer(
+        r"- target:\s*\{fileID:\s*(-?\d+)[^}]*\}\s*\n"
+        r"(?P<props>.*?)(?=- target:|\n    m_RemovedComponents:|\Z)",
+        raw_yaml,
+        re.S,
+    ):
+        props = block.group("props")
+        if "m_Materials.Array.data[" not in props:
+            continue
+        renderer_id = block.group(1)
+        slots = renderer_slots.setdefault(renderer_id, {})
+        for pm in re.finditer(
+            r"m_Materials\.Array\.data\[(\d+)\]\s*\n\s*value:\s*\n\s*objectReference:\s*\{fileID:[^,]+,\s*guid:\s*([a-f0-9]{32})",
+            props,
+        ):
+            idx = int(pm.group(1))
+            slots[idx] = pm.group(2)
+    # Convert to contiguous ordered arrays, preserving Unity slot holes.
+    arrays: List[List[str]] = []
+    for rid in renderer_slots:
+        slots = renderer_slots[rid]
+        if not slots:
+            continue
+        ordered = []
+        max_idx = max(slots)
+        for i in range(max_idx + 1):
+            ordered.append(slots.get(i, ""))
+        arrays.append(ordered)
+    return arrays
+
+
 def normalize_prefab_material_paths(materials: List[str]) -> List[str]:
     """Normalize material resources without turning null slots into paths."""
     return [
@@ -1301,40 +1359,33 @@ def synchronize_unitypackage_materials(
                 pack_dir = get_pack_root(os.path.normpath(os.path.join(project_root, rel_path)))
 
                 prefab_guids = parse_unity_prefab_material_arrays(raw_yaml)
-                mat_paths = [] if prefab_guids is None else []
-                for mg in prefab_guids or []:
-                    res_p = mat_guid_to_res.get(mg)
-                    if not res_p:
-                        mp = guid_to_path.get(mg)
-                        if mp and mp.endswith(".mat"):
-                            res_p = package_res_path(project_root, mp)
-                            if res_p:
-                                res_p += ".tres"
-                    clean_p = res_p if res_p and res_p.endswith(".tres") else (res_p + ".tres" if res_p else "")
-                    mat_paths.append(clean_p)
+                prefab_stem = os.path.splitext(os.path.basename(rel_path))[0].lower()
 
-                if prefab_guids is None:
-                    property_blocks = []
-                else:
-                    property_blocks = re.finditer(r"propertyPath:\s*m_Materials\.Array\.data\[(\d+)\]\s*\n\s*value:\s*\n\s*objectReference:\s*\{fileID:[^,]+,\s*guid:\s*([a-f0-9]{32})", raw_yaml)
-                for block in property_blocks:
-                    idx, mg = int(block.group(1)), block.group(2)
-                    res_p = mat_guid_to_res.get(mg)
-                    if not res_p:
-                        mp = guid_to_path.get(mg)
-                        if mp and mp.endswith(".mat"):
-                            res_p = package_res_path(project_root, mp)
-                            if res_p:
-                                res_p += ".tres"
-                    if res_p:
-                        clean_p = res_p if res_p.endswith(".tres") else res_p + ".tres"
-                        while len(mat_paths) <= idx:
-                            # An indexed override does not imply that the
-                            # intervening Unity slots contain this material.
-                            # Preserve positional holes until the override is
-                            # applied at its explicit index.
-                            mat_paths.append("")
-                        mat_paths[idx] = clean_p
+                # Property overrides can come from multiple renderers pointing at
+                # the SAME shared FBX (a body plus child renderers such as glass
+                # frames, shutters, ceilings). Each renderer owns its own
+                # positional material array starting at index 0. Flattening all
+                # renderers into one index-keyed list lets a later child renderer
+                # silently overwrite a body slot. Group by renderer and use the
+                # primary (longest) renderer for the FBX per-slot mapping.
+                renderer_guid_groups = []
+                if prefab_guids:
+                    renderer_guid_groups.append(prefab_guids)
+                renderer_guid_groups.extend(parse_unity_prefab_renderer_material_groups(raw_yaml))
+
+                mat_paths = []
+                if renderer_guid_groups:
+                    primary = max(renderer_guid_groups, key=len)
+                    for mg in primary:
+                        res_p = mat_guid_to_res.get(mg)
+                        if not res_p:
+                            mp = guid_to_path.get(mg)
+                            if mp and mp.endswith(".mat"):
+                                res_p = package_res_path(project_root, mp)
+                                if res_p:
+                                    res_p += ".tres"
+                        clean_p = res_p if res_p and res_p.endswith(".tres") else (res_p + ".tres" if res_p else "")
+                        mat_paths.append(clean_p)
 
                 if mat_paths:
                     mesh_guids = re.findall(r"m_Mesh:\s*\{fileID:[^,]+,\s*guid:\s*([a-f0-9]{32})", raw_yaml)
@@ -1343,7 +1394,6 @@ def synchronize_unitypackage_materials(
                         if mesh_path:
                             model_stem = os.path.splitext(os.path.basename(mesh_path))[0].lower()
                             add_prefab_mats(pack_dir, model_stem, mat_paths)
-                    prefab_stem = os.path.splitext(os.path.basename(rel_path))[0].lower()
                     add_prefab_mats(pack_dir, prefab_stem, mat_paths)
                     contexts = []
                     for context in parse_unity_prefab_renderer_contexts(raw_yaml):

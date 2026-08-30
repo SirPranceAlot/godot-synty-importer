@@ -341,6 +341,50 @@ def test_incomplete_layer_mapping_does_not_invent_material_ids():
     assert record["material_ids"] == []
 
 
+def test_renderer_material_groups_preserve_body_slot_from_shared_child_renderer():
+    # Regression for the shared-FBX cockpit case: a single model that has a body
+    # renderer (5 material slots) plus a child renderer (1 slot) that ALSO writes
+    # index 0. Both renderers' overrides start at index 0, so a naive flatten
+    # lets the child clobber the body's slot 0 (the floor panel material).
+    raw = """%YAML 1.1
+--- !u!1001 &6024714108400036464
+PrefabInstance:
+  m_Modification:
+    m_Modifications:
+    - target: {fileID: -7511558181221131132, guid: 467aeff4faaeb7a4097052b8f207472c, type: 3}
+      propertyPath: m_Materials.Array.data[0]
+      value: 
+      objectReference: {fileID: 2100000, guid: d6ce7a60dd96c6d4795ea3ff4041f59f, type: 2}
+    - target: {fileID: -7511558181221131132, guid: 467aeff4faaeb7a4097052b8f207472c, type: 3}
+      propertyPath: m_Materials.Array.data[1]
+      value: 
+      objectReference: {fileID: 2100000, guid: 2a5e4e6d34099fb433c3e89a80ddc457, type: 2}
+    - target: {fileID: -7511558181221131132, guid: 467aeff4faaeb7a4097052b8f207472c, type: 3}
+      propertyPath: m_Materials.Array.data[4]
+      value: 
+      objectReference: {fileID: 2100000, guid: f94c55d0b2966af44819dee9ac8a5bda, type: 2}
+    - target: {fileID: -2520931308755787650, guid: 467aeff4faaeb7a4097052b8f207472c, type: 3}
+      propertyPath: m_Materials.Array.data[0]
+      value: 
+      objectReference: {fileID: 2100000, guid: 7ccc111122229999aaaabbbbccccdddd, type: 2}
+    m_RemovedComponents: []
+  m_SourcePrefab: {fileID: 100100000, guid: 467fabc7f4faaeb7a4097052b8f207472c, type: 3}
+"""
+    groups = automator.parse_unity_prefab_renderer_material_groups(raw)
+    # Two distinct renderers, each an ordered array.
+    assert len(groups) == 2
+    body = groups[0]
+    child = groups[1]
+    # Body keeps its full 5-slot array (slot 0 = the body material, NOT the child's).
+    assert body[0] == "d6ce7a60dd96c6d4795ea3ff4041f59f"
+    assert body[1] == "2a5e4e6d34099fb433c3e89a80ddc457"
+    assert len(body) == 5  # slot hole at 2 and 3 preserved, then index 4 filled.
+    # Child renderer owns its own slot 0 (a different material), independent.
+    assert child[0] == "7ccc111122229999aaaabbbbccccdddd"
+    # Primary = longest renderer (the body); its slot 0 is preserved.
+    assert max(groups, key=len) is body
+
+
 if __name__ == "__main__":
     skipped = 0
     for name, fn in sorted(globals().items()):
