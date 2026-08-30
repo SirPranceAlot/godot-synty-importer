@@ -54,3 +54,9 @@ If you already extracted or moved Synty assets in your project:
 - **Texture Format Normalization**: Detects and fixes misnamed image formats and corrects sRGB / normal map compression flags in `.import` files.
 - **Triplanar Material Configuration**: Configures world-triplanar UV projection and scaling on modular building materials.
 - **UID Synchronization**: Updates all scene and prefab UID references to prevent invalid UID console warnings.
+
+---
+
+## 📄 License
+
+MIT License. Free for use in personal and commercial Godot projects. See the full license text in `LICENSE` (in this folder).

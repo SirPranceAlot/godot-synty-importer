@@ -1,0 +1,7 @@
+# Normalize line endings
+* text=auto eol=lf
+
+# Only ship the addon folder when the Asset Library builds the ZIP
+/**        export-ignore
+/addons    !export-ignore
+/addons/** !export-ignore
