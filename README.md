@@ -21,12 +21,13 @@ When importing Synty asset packs into Godot 4, several recurring engine incompat
 - **Universal Synty Pack Compatibility**: Fully dynamic heuristics support any Synty Studios pack (Polygon, Simple, Sidekick, Fantasy, Sci-Fi, Dungeon, City, Apocalypse, Western, Samurai, Nature, etc.).
 - **Dynamic Missing Texture & PSD Resolver**: Dynamically scans all scenes, materials, and FBX binaries, auto-generating neutral and atlas texture stubs so missing embedded paths never crash or trigger 404 image errors.
 - **Automated StandardMaterial3D Generation**: Automatically generates Godot 4 `StandardMaterial3D` resources for any asset pack that only includes raw FBX meshes and textures.
-- **Deep FBX Binary Slot Parsing**: Detects internal Maya/3ds Max material slots in all `.fbx` files and applies 4-tier semantic material mapping directly into native Godot `.fbx.import` files.
+- **Deep FBX Binary Slot Parsing**: Detects internal Maya/3ds Max material slots in all `.fbx` files and applies a 7-tier semantic fallback system to map them directly into native Godot `.fbx.import` files.
 - **Universal Multi-Character Rig Visibility**: Automatically normalizes skeleton hierarchies to `Skeleton3D` and sets selective mesh visibility on multi-character prefabs.
 - **Texture Format Sanitization**: Detects misnamed image formats (e.g. TGA data named `.png`) and normalizes sRGB / normal map compression flags.
 - **Direct .unitypackage Import**: Extract raw `.unitypackage` files directly into Godot and configure all assets automatically in one step.
 - **Project-Wide UID Synchronization**: Re-indexes and updates all scene and prefab UIDs to guarantee zero console warnings.
 - **One-Click Godot 4 Addon**: Run directly inside the Godot Editor via **Project > Tools > Fix Synty Asset Packs** or **Project > Tools > Import Synty .unitypackage...**.
+- **Direct Unity Scene Compilation**: Compiles raw Unity `.unity` scene files into Godot `.tscn` scenes.
 
 ---
 
